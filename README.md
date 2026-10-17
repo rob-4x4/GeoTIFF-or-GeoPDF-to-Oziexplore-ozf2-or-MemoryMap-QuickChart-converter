@@ -1,5 +1,8 @@
 # GeoTIFF QuickChart Converter
 
+> **AI-generated code notice:** This repository contains AI-generated code.
+> Review, test, and validate it before using it with maps or other data.
+
 This is an experimental, standalone GeoTIFF-to-Quick Chart converter for a GDAL
 toolchain.  It preserves the input file and writes a newly generated,
 unencrypted, legacy Quick Chart v2 (`.qct`) map.
