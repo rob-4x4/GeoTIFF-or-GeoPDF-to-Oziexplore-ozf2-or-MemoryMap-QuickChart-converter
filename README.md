@@ -15,8 +15,6 @@ tiles itself, so it does not modify the installed GDAL binaries or plug-in folde
   `gdalinfo`.
 - Python 3.10+ with Pillow.
 
-The current PC already has GDAL 3.12.1 and a suitable Python/Pillow runtime.
-
 Install the Python dependency on another machine with:
 
 ```powershell
@@ -47,14 +45,14 @@ third-party documents unless you have the right to redistribute them.
 Run the automated tests first:
 
 ```powershell
-& 'C:\Users\roblo\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' .\geotiff_to_qct.py --test
+python .\geotiff_to_qct.py --test
 ```
 
 Then convert exactly one input, writing to a new folder:
 
 ```powershell
-& 'C:\Users\roblo\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' .\geotiff_to_qct.py `
-  'D:\maps\input.tif' 'D:\maps\qct-proof\input.qct' --validation-gpx
+python .\geotiff_to_qct.py `
+  '<source-geotiff.tif>' '<output-directory>\map.qct' --validation-gpx
 ```
 
 The converter refuses to overwrite an existing QCT unless `--overwrite` is
@@ -70,8 +68,8 @@ matching printed latitude/longitude or map-grid intersections. Use a denser
 grid only when the source map has enough labelled intersections:
 
 ```powershell
-... geotiff_to_qct.py 'D:\maps\input.tif' 'D:\maps\qct-proof\input.qct' `
-  --validation-gpx 'D:\maps\qct-proof\input-checks.gpx' --validation-grid 5
+python .\geotiff_to_qct.py '<source-geotiff.tif>' '<output-directory>\map.qct' `
+  --validation-gpx '<output-directory>\map-checks.gpx' --validation-grid 5
 ```
 
 ## Rebuild from scratch
