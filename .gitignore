@@ -1,0 +1,21 @@
+# Python build and test by-products
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Generated conversion artefacts.  Keep the proof instructions, but do not
+# version private/licensed map inputs or generated binary maps by default.
+proof/*
+!proof/README.md
+*.qct
+*.qc3
+*.tif
+*.tiff
+*.validation.gpx
+*.qct.validation.json
+
+# OS/editor files
+.DS_Store
+Thumbs.db
