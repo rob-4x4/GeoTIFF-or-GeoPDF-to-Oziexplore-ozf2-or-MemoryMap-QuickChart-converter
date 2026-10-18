@@ -43,6 +43,14 @@ The original code in this repository is licensed under the GNU General Public
 License, version 3 only. See [`LICENSE`](LICENSE). Do not add map data or
 third-party documents unless you have the right to redistribute them.
 
+## Included test data
+
+The repository includes maintainer-declared public-domain GeoTIFF fixtures for
+reproducible tests. See [`test-data/README.md`](test-data/README.md) for their
+SHA-256 hashes, test coverage, conversion commands, and the Android/Memory-Map
+acceptance procedure. Generated QCT, GPX, and JSON evidence remains ignored by
+Git.
+
 ## One-map proof
 
 Run the automated tests first:

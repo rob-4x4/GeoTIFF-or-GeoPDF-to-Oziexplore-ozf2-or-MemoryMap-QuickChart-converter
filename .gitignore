@@ -15,6 +15,10 @@ proof/*
 *.tiff
 *.validation.gpx
 *.qct.validation.json
+test-output/
+
+# Committed, public-domain GeoTIFF fixtures used by the reproducible tests.
+!test-data/fixtures/*.tif
 
 # OS/editor files
 .DS_Store
