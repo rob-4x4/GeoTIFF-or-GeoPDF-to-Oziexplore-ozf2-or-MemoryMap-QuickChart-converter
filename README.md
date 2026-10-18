@@ -89,6 +89,14 @@ per source file, plus the same JSON validation report created by the command
 line tool. It protects existing QCT and GPX files unless **Allow replacement**
 is deliberately selected. Source GeoTIFFs are never modified.
 
+At startup the **GDAL readiness** panel checks that `gdalinfo`,
+`gdal_translate`, and `gdaltransform` can run, that the GeoTIFF driver is
+available, and whether the GeoPDF driver is present for future GeoPDF support.
+If GDAL is not on `PATH`, use **Choose GDAL bin folder…** and select the folder
+containing those programs. This setting applies only to the open GUI session;
+it does not edit Windows environment variables, the registry, or GDAL
+configuration files.
+
 By default it also writes 3 by 3 image-frame validation GPX files. Enable
 **projected-grid GPX checkpoints** only for projected, metre-based source maps
 such as MGA or UTM; choose 50,000 metres for a manageable Australian 1:250,000
