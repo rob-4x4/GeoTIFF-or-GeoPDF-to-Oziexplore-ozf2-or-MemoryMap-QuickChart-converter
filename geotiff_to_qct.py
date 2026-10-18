@@ -619,7 +619,7 @@ def write_validation_gpx(path: Path, transform: GeoTransform | QctCalibration, w
 
 
 def projected_grid_pixels(transform: GeoTransform, width: int, height: int,
-                          spacing_metres: int) -> list[tuple[int, int, int, int]]:
+                          spacing_metres: int) -> list[tuple[int, int, float, float]]:
     """Return source-pixel positions for whole projected-coordinate grid intersections."""
     if spacing_metres <= 0:
         raise ValueError("projected grid spacing must be positive")
@@ -635,19 +635,18 @@ def projected_grid_pixels(transform: GeoTransform, width: int, height: int,
     last_easting = math.floor(max(eastings) / spacing_metres) * spacing_metres
     first_northing = math.ceil(min(northings) / spacing_metres) * spacing_metres
     last_northing = math.floor(max(northings) / spacing_metres) * spacing_metres
-    points: list[tuple[int, int, int, int]] = []
+    points: list[tuple[int, int, float, float]] = []
     for easting in range(first_easting, last_easting + 1, spacing_metres):
         for northing in range(first_northing, last_northing + 1, spacing_metres):
             delta_easting, delta_northing = easting - a, northing - d
             x = (f * delta_easting - c * delta_northing) / determinant
             y = (-e * delta_easting + b * delta_northing) / determinant
-            pixel_x, pixel_y = round(x), round(y)
-            if 0 <= pixel_x < width and 0 <= pixel_y < height:
-                points.append((easting, northing, pixel_x, pixel_y))
+            if 0 <= x < width and 0 <= y < height:
+                points.append((easting, northing, x, y))
     return points
 
 
-def write_projected_grid_gpx(path: Path, calibration: QctCalibration, source_transform: GeoTransform,
+def write_projected_grid_gpx(path: Path, source_wkt: str, source_transform: GeoTransform,
                              width: int, height: int, spacing_metres: int) -> int:
     """Write GPX waypoints at known projected-map grid intersections."""
     points = projected_grid_pixels(source_transform, width, height, spacing_metres)
@@ -662,15 +661,16 @@ def write_projected_grid_gpx(path: Path, calibration: QctCalibration, source_tra
         "Waypoints are placed on exact source projected-coordinate grid intersections. "
         "Load with the converted QCT and confirm each waypoint lies on the matching printed grid crossing."
     )
-    for easting, northing, x, y in points:
-        longitude, latitude = calibration.xy_to_lon_lat(x, y)
+    longitude_latitude = transform_points(source_wkt, "EPSG:4326",
+                                          [(easting, northing) for easting, northing, _, _ in points])
+    for (easting, northing, x, y), (longitude, latitude) in zip(points, longitude_latitude, strict=True):
         waypoint = ET.SubElement(root, f"{{{namespace}}}wpt", {
             "lat": f"{latitude:.10f}", "lon": f"{longitude:.10f}",
         })
         label = f"QCT-grid-E{easting}-N{northing}"
         ET.SubElement(waypoint, f"{{{namespace}}}name").text = label
         ET.SubElement(waypoint, f"{{{namespace}}}desc").text = (
-            f"Source projected grid E={easting} m, N={northing} m; source pixel x={x}, y={y}. "
+            f"Source projected grid E={easting} m, N={northing} m; source pixel x={x:.3f}, y={y:.3f}. "
             "It should be exactly on this printed map-grid intersection."
         )
         ET.SubElement(waypoint, f"{{{namespace}}}sym").text = "Waypoint"
@@ -821,7 +821,7 @@ class QuickChartTests(unittest.TestCase):
         transform = GeoTransform((1000, 10, 0, 5000, 0, -10))
         points = projected_grid_pixels(transform, 100, 80, 250)
         self.assertEqual(len(points), 16)
-        self.assertIn((1500, 4500, 50, 50), points)
+        self.assertIn((1500, 4500, 50.0, 50.0), points)
         self.assertTrue(all(0 <= x < 100 and 0 <= y < 80 for _, _, x, y in points))
 
     def test_gdal_geotiff_end_to_end_when_available(self) -> None:
@@ -873,11 +873,14 @@ def main(arguments: Iterable[str] | None = None) -> int:
         if target.exists() and not args.overwrite:
             raise FileExistsError(f"Refusing to overwrite existing GPX: {target}")
         info = read_info(source)
-        calibration, forward_error, inverse_error = native_qct_calibration(source, info)
+        _calibration, forward_error, inverse_error = native_qct_calibration(source, info)
         transform = GeoTransform(tuple(float(value) for value in info["geoTransform"]))
         width, height = (int(value) for value in info["size"])
+        source_wkt = (info.get("coordinateSystem") or {}).get("wkt")
+        if not isinstance(source_wkt, str):
+            raise ValueError("source needs a defined coordinate system")
         target.parent.mkdir(parents=True, exist_ok=True)
-        count = write_projected_grid_gpx(target, calibration, transform, width, height,
+        count = write_projected_grid_gpx(target, source_wkt, transform, width, height,
                                          args.projected_grid_metres)
         print(json.dumps({"validation_gpx": str(target), "checkpoints": count,
                           "calibration_fit_max_abs_error_degrees": forward_error,
