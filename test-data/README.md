@@ -47,9 +47,10 @@ end-to-end conversion.
 
 ## One-fixture conversion proof
 
-Start with the DuBois UTM fixture rather than converting every map. It is a
-better visual acceptance map because its local-area UTM reprojection remains
-close to rectangular. This creates new outputs only; it never overwrites the
+Start with the DuBois UTM fixture rather than converting every map. The
+converter retains its native raster grid and uses QCT calibration polynomials,
+so this is a good proof that text, contours, and other fine cartography retain
+their source pixels. This creates new outputs only; it never overwrites the
 fixture.
 
 ```powershell
@@ -73,9 +74,11 @@ Get-Content (Join-Path $proof 'dubois-pa.qct.validation.json') -Raw
 Before continuing, the hash comparison must be `True`. The JSON must report
 `source_preserved: true`, `pixel_round_trip: true`, and a zero (or negligible)
 `calibration_max_abs_error_degrees`. It also records the source and QCT pixel
-dimensions, the number of QCT palette entries, and `reprojection_resampling`.
-The default must be `near`; this avoids false blended colours around the
-source's cartographic linework.
+dimensions, the number of QCT palette entries, and
+`calibration_fit_max_abs_error_degrees` and
+`inverse_calibration_fit_max_abs_error_pixels`. The source and QCT dimensions
+must match, and `raster_reprojection` must report that native source pixels
+were retained.
 
 ## Android / Memory-Map acceptance test
 

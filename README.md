@@ -8,13 +8,14 @@ toolchain.  It preserves the input file and writes a newly generated,
 unencrypted, legacy Quick Chart v2 (`.qct`) map.
 
 It is not a replacement for Memory-Map Navigator and does not implement QC3,
-licensing, DRM, encrypted maps, or existing-map conversion.  It calls GDAL to
-reproject the input to WGS-84 and render RGB pixels.  It then writes legacy QCT
-tiles itself, so it does not modify the installed GDAL binaries or plug-in folder.
+licensing, DRM, encrypted maps, or existing-map conversion. It uses GDAL to
+derive WGS-84 calibration polynomials while retaining the input raster grid,
+then writes legacy QCT tiles itself. It does not modify installed GDAL binaries
+or plug-in folders.
 
 ## Requirements
 
-- GDAL command-line tools on `PATH`: `gdalwarp`, `gdal_translate`, and
+- GDAL command-line tools on `PATH`: `gdal_translate`, `gdaltransform`, and
   `gdalinfo`.
 - Python 3.10+ with Pillow.
 
@@ -36,12 +37,11 @@ bulk conversion.
 ### Image-quality policy
 
 The converter aims to retain the source map's legibility as closely as legacy
-QCT permits: it uses nearest-neighbour reprojection to avoid inventing edge
-colours, all 128 QCT palette entries, palette coverage that preserves small
-source palettes exactly, no error-diffusion dithering, and a pre-calculated
-symmetric interpolation matrix for scaled views. The generated
-QCT may have different pixel dimensions because it is reprojected to WGS-84,
-but the source GeoTIFF is never resampled down deliberately.
+QCT permits: it retains the original raster dimensions and pixel glyphs,
+uses QCT's third-order WGS-84 calibration polynomials, supports all 128 QCT
+palette entries, preserves small source palettes exactly, uses no
+error-diffusion dithering, and generates a symmetric interpolation matrix for
+scaled views. No raster reprojection or resampling is performed.
 
 Legacy QCT cannot reproduce every GeoTIFF compression scheme or every source
 colour. Treat a map as accepted only when labels, contours, linework, colours,
@@ -93,8 +93,8 @@ python .\geotiff_to_qct.py `
 The converter refuses to overwrite an existing QCT unless `--overwrite` is
 explicitly supplied.  It writes a neighbouring `.validation.json` log containing
 source/output SHA-256 hashes, source-preservation confirmation, tile/pixel
-round-trip validation, calibration-coefficient validation, source/QCT pixel
-dimensions, palette-entry count, and the resampling method used.
+round-trip validation, calibration-coefficient validation, the source/QCT
+pixel dimensions, palette-entry count, and polynomial-fit error.
 
 `--validation-gpx` writes a sibling `input.validation.gpx` file by default. It
 contains a 3 by 3 set of named WGS-84 waypoints covering the corners, centre,
@@ -111,7 +111,7 @@ python .\geotiff_to_qct.py '<source-geotiff.tif>' '<output-directory>\map.qct' `
 ## Rebuild from scratch
 
 1. Copy this folder to the machine that has GDAL and Python/Pillow.
-2. Confirm `gdalwarp --version`, `gdal_translate --version`, and
+2. Confirm `gdaltransform --version`, `gdal_translate --version`, and
    `gdalinfo --version` work in the intended shell.
 3. Install Pillow into the Python environment if needed:
    `python -m pip install Pillow`.

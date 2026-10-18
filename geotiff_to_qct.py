@@ -47,6 +47,46 @@ class GeoTransform:
         return a + b * x + c * y, d + e * x + f * y
 
 
+POLY_TERMS = ((0, 0), (1, 0), (0, 1), (2, 0), (1, 1), (0, 2),
+              (3, 0), (2, 1), (1, 2), (0, 3))
+INVERSE_HEADER_ORDER = (0, 2, 1, 5, 4, 3, 9, 8, 7, 6)
+
+
+def evaluate_polynomial(coefficients: tuple[float, ...], x: float, y: float) -> float:
+    return sum(coefficient * x ** power_x * y ** power_y
+               for coefficient, (power_x, power_y) in zip(coefficients, POLY_TERMS, strict=True))
+
+
+@dataclass(frozen=True)
+class QctCalibration:
+    """Forward and reverse QCT third-order WGS-84 calibration polynomials."""
+
+    longitude: tuple[float, ...]
+    latitude: tuple[float, ...]
+    east: tuple[float, ...]
+    north: tuple[float, ...]
+
+    @classmethod
+    def from_affine(cls, transform: GeoTransform) -> "QctCalibration":
+        a, b, c, d, e, f = transform.values
+        determinant = b * f - c * e
+        if abs(determinant) < 1e-30:
+            raise ValueError("WGS-84 affine transform is singular")
+        zero = (0.0,) * 7
+        return cls(
+            (a, b, c, *zero), (d, e, f, *zero),
+            ((-f * a + c * d) / determinant, f / determinant, -c / determinant, *zero),
+            ((e * a - b * d) / determinant, -e / determinant, b / determinant, *zero),
+        )
+
+    def xy_to_lon_lat(self, x: float, y: float) -> tuple[float, float]:
+        return evaluate_polynomial(self.longitude, x, y), evaluate_polynomial(self.latitude, x, y)
+
+    def lon_lat_to_xy(self, longitude: float, latitude: float) -> tuple[float, float]:
+        return (evaluate_polynomial(self.east, longitude, latitude),
+                evaluate_polynomial(self.north, longitude, latitude))
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -75,6 +115,108 @@ def read_info(dataset: Path) -> dict:
     if completed.returncode:
         raise RuntimeError(completed.stderr.strip() or "gdalinfo failed")
     return json.loads(completed.stdout)
+
+
+def transform_points(source_srs: str, target_srs: str,
+                     points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Transform a batch of XY points through GDAL without raster resampling."""
+    command = [require_program("gdaltransform"), "-s_srs", source_srs,
+               "-t_srs", target_srs]
+    input_text = "".join(f"{x:.15g} {y:.15g}\n" for x, y in points)
+    completed = subprocess.run(command, input=input_text, text=True, capture_output=True)
+    if completed.returncode:
+        raise RuntimeError(completed.stderr.strip() or "gdaltransform failed")
+    transformed = []
+    for line in completed.stdout.splitlines():
+        values = line.split()
+        if len(values) < 2:
+            raise ValueError(f"unexpected gdaltransform output: {line!r}")
+        transformed.append((float(values[0]), float(values[1])))
+    if len(transformed) != len(points):
+        raise ValueError("gdaltransform did not return one result per calibration point")
+    return transformed
+
+
+def solve_linear_system(matrix: list[list[float]], values: list[float]) -> list[float]:
+    """Solve a small well-conditioned square system by pivoted elimination."""
+    size = len(values)
+    augmented = [row[:] + [value] for row, value in zip(matrix, values, strict=True)]
+    for column in range(size):
+        pivot = max(range(column, size), key=lambda row: abs(augmented[row][column]))
+        if abs(augmented[pivot][column]) < 1e-20:
+            raise ValueError("singular calibration fit")
+        augmented[column], augmented[pivot] = augmented[pivot], augmented[column]
+        scale = augmented[column][column]
+        augmented[column] = [value / scale for value in augmented[column]]
+        for row in range(size):
+            if row == column:
+                continue
+            scale = augmented[row][column]
+            if scale:
+                augmented[row] = [left - scale * right
+                                  for left, right in zip(augmented[row], augmented[column], strict=True)]
+    return [row[-1] for row in augmented]
+
+
+def fit_polynomial(inputs: list[tuple[float, float]], outputs: list[float]) -> tuple[float, ...]:
+    """Fit an order-three polynomial and expand it into QCT's raw coordinates."""
+    if len(inputs) != len(outputs) or len(inputs) < len(POLY_TERMS):
+        raise ValueError("insufficient calibration points")
+    xs, ys = zip(*inputs, strict=True)
+    centre_x, centre_y = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+    scale_x, scale_y = (max(xs) - min(xs)) / 2, (max(ys) - min(ys)) / 2
+    if not scale_x or not scale_y:
+        raise ValueError("degenerate calibration extent")
+    normal = [[0.0] * len(POLY_TERMS) for _ in POLY_TERMS]
+    right = [0.0] * len(POLY_TERMS)
+    for (x, y), output in zip(inputs, outputs, strict=True):
+        u, v = (x - centre_x) / scale_x, (y - centre_y) / scale_y
+        row = [u ** power_x * v ** power_y for power_x, power_y in POLY_TERMS]
+        for left in range(len(POLY_TERMS)):
+            right[left] += row[left] * output
+            for column in range(len(POLY_TERMS)):
+                normal[left][column] += row[left] * row[column]
+    normalised = solve_linear_system(normal, right)
+    expanded = {(power_x, power_y): 0.0 for power_x, power_y in POLY_TERMS}
+    for coefficient, (power_u, power_v) in zip(normalised, POLY_TERMS, strict=True):
+        for power_x in range(power_u + 1):
+            factor_x = (math.comb(power_u, power_x) * (-centre_x) ** (power_u - power_x)
+                        / scale_x ** power_u)
+            for power_y in range(power_v + 1):
+                factor_y = (math.comb(power_v, power_y) * (-centre_y) ** (power_v - power_y)
+                            / scale_y ** power_v)
+                expanded[(power_x, power_y)] += coefficient * factor_x * factor_y
+    return tuple(expanded[term] for term in POLY_TERMS)
+
+
+def native_qct_calibration(source: Path, info: dict) -> tuple[QctCalibration, float, float]:
+    """Fit QCT polynomials to the native source raster, retaining every source pixel."""
+    size = info.get("size")
+    geotransform = info.get("geoTransform")
+    wkt = (info.get("coordinateSystem") or {}).get("wkt")
+    if (not isinstance(size, list) or len(size) != 2 or not isinstance(geotransform, list)
+            or len(geotransform) != 6 or not isinstance(wkt, str)):
+        raise ValueError("source needs an affine geotransform and a defined coordinate system")
+    width, height = (int(size[0]), int(size[1]))
+    a, b, c, d, e, f = (float(value) for value in geotransform)
+    samples = [(width * column / 6, height * row / 6)
+               for row in range(7) for column in range(7)]
+    source_coordinates = [(a + b * x + c * y, d + e * x + f * y) for x, y in samples]
+    lon_lat = transform_points(wkt, "EPSG:4326", source_coordinates)
+    longitude = fit_polynomial(samples, [point[0] for point in lon_lat])
+    latitude = fit_polynomial(samples, [point[1] for point in lon_lat])
+    east = fit_polynomial(lon_lat, [point[0] for point in samples])
+    north = fit_polynomial(lon_lat, [point[1] for point in samples])
+    calibration = QctCalibration(longitude, latitude, east, north)
+    forward_error = max(abs(actual - expected)
+                        for pixel, expected_point in zip(samples, lon_lat, strict=True)
+                        for actual, expected in zip(calibration.xy_to_lon_lat(*pixel), expected_point,
+                                                    strict=True))
+    inverse_error = max(abs(actual - expected)
+                        for lon_lat_point, expected_point in zip(lon_lat, samples, strict=True)
+                        for actual, expected in zip(calibration.lon_lat_to_xy(*lon_lat_point), expected_point,
+                                                    strict=True))
+    return calibration, forward_error, inverse_error
 
 
 def to_little_u32(buffer: bytearray, offset: int, value: int) -> None:
@@ -271,7 +413,22 @@ def interpolation_matrix(indexed: Image.Image) -> bytes:
     return bytes(matrix)
 
 
-def qct_bytes(indexed: Image.Image, transform: GeoTransform, title: str) -> bytes:
+def write_coefficients(buffer: bytearray, base: int, coefficients: tuple[float, ...],
+                       *, inverse: bool = False) -> None:
+    order = INVERSE_HEADER_ORDER if inverse else range(len(POLY_TERMS))
+    for offset, coefficient_index in enumerate(order):
+        to_little_f64(buffer, base + 8 * offset, coefficients[coefficient_index])
+
+
+def read_coefficients(data: bytes, base: int, *, inverse: bool = False) -> tuple[float, ...]:
+    values = [0.0] * len(POLY_TERMS)
+    order = INVERSE_HEADER_ORDER if inverse else range(len(POLY_TERMS))
+    for offset, coefficient_index in enumerate(order):
+        values[coefficient_index] = read_f64(data, base + 8 * offset)
+    return tuple(values)
+
+
+def qct_bytes(indexed: Image.Image, transform: GeoTransform | QctCalibration, title: str) -> bytes:
     if indexed.mode != "P":
         raise ValueError("QCT writer expects a paletted Pillow image")
     width, height = indexed.size
@@ -304,23 +461,13 @@ def qct_bytes(indexed: Image.Image, transform: GeoTransform, title: str) -> byte
     to_little_u32(result, extended + 8, append_ascii(result, "GDAL"))
     to_little_u32(result, 0x54, extended)
 
-    a, b, c, d, e, f = transform.values
-    determinant = b * f - c * e
-    if abs(determinant) < 1e-30:
-        raise ValueError("WGS-84 affine transform is singular")
+    calibration = (QctCalibration.from_affine(transform)
+                   if isinstance(transform, GeoTransform) else transform)
     # QCT stores inverse eas/nor polynomials, then forward lat/lon polynomials.
-    to_little_f64(result, 0x60, (-f * a + c * d) / determinant)
-    to_little_f64(result, 0x68, -c / determinant)  # easY (latitude)
-    to_little_f64(result, 0x70, f / determinant)   # easX (longitude)
-    to_little_f64(result, 0xB0, (e * a - b * d) / determinant)
-    to_little_f64(result, 0xB8, b / determinant)   # norY (latitude)
-    to_little_f64(result, 0xC0, -e / determinant)  # norX (longitude)
-    to_little_f64(result, 0x100, d)  # lat
-    to_little_f64(result, 0x108, e)  # latX
-    to_little_f64(result, 0x110, f)  # latY
-    to_little_f64(result, 0x150, a)  # lon
-    to_little_f64(result, 0x158, b)  # lonX
-    to_little_f64(result, 0x160, c)  # lonY
+    write_coefficients(result, 0x60, calibration.east, inverse=True)
+    write_coefficients(result, 0xB0, calibration.north, inverse=True)
+    write_coefficients(result, 0x100, calibration.latitude)
+    write_coefficients(result, 0x150, calibration.longitude)
 
     raw_palette = (indexed.getpalette() or []) + [0] * 768
     for index in range(MAX_COLOURS):
@@ -334,7 +481,7 @@ def qct_bytes(indexed: Image.Image, transform: GeoTransform, title: str) -> byte
     padded_width, padded_height = tiles_wide * TILE, tiles_high * TILE
     for index, (x, y) in enumerate(((0, 0), (padded_width, 0),
                                     (padded_width, padded_height), (0, padded_height))):
-        longitude, latitude = transform.xy_to_lon_lat(x, y)
+        longitude, latitude = calibration.xy_to_lon_lat(x, y)
         to_little_f64(result, outline + index * 16, latitude)
         to_little_f64(result, outline + index * 16 + 8, longitude)
     to_little_u32(result, 0x58, 4)
@@ -372,7 +519,7 @@ def read_f64(data: bytes, offset: int) -> float:
     return struct.unpack_from("<d", data, offset)[0]
 
 
-def decode_qct(data: bytes) -> tuple[Image.Image, GeoTransform]:
+def decode_qct(data: bytes) -> tuple[Image.Image, QctCalibration]:
     if len(data) < HEADER_SIZE or read_u32(data, 0) != MAGIC or read_u32(data, 4) != VERSION:
         raise ValueError("not an unencrypted legacy QCT v2 map")
     tiles_wide, tiles_high = read_u32(data, 8), read_u32(data, 12)
@@ -403,14 +550,14 @@ def decode_qct(data: bytes) -> tuple[Image.Image, GeoTransform]:
             destination[destination_offset : destination_offset + TILE] = \
                 interlaced[source_offset : source_offset + TILE]
     output.frombytes(bytes(destination))
-    transform = GeoTransform((read_f64(data, 0x150), read_f64(data, 0x158),
-                              read_f64(data, 0x160), read_f64(data, 0x100),
-                              read_f64(data, 0x108), read_f64(data, 0x110)))
-    return output, transform
+    calibration = QctCalibration(read_coefficients(data, 0x150), read_coefficients(data, 0x100),
+                                 read_coefficients(data, 0x60, inverse=True),
+                                 read_coefficients(data, 0xB0, inverse=True))
+    return output, calibration
 
 
 def validate_qct(qct: Path, expected: Image.Image | None = None,
-                 expected_transform: GeoTransform | None = None) -> dict:
+                 expected_transform: GeoTransform | QctCalibration | None = None) -> dict:
     data = qct.read_bytes()
     decoded, transform = decode_qct(data)
     result: dict[str, object] = {
@@ -439,7 +586,7 @@ def validate_qct(qct: Path, expected: Image.Image | None = None,
     return result
 
 
-def write_validation_gpx(path: Path, transform: GeoTransform, width: int, height: int,
+def write_validation_gpx(path: Path, transform: GeoTransform | QctCalibration, width: int, height: int,
                          grid: int) -> None:
     """Write named WGS-84 checks against printed grid intersections on the map."""
     if not 2 <= grid <= 9:
@@ -486,43 +633,37 @@ def convert_geotiff(source: Path, destination: Path, *, overwrite: bool = False,
             raise FileExistsError(f"Refusing to overwrite existing GPX: {validation_gpx}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     source_hash = sha256(source)
+    source_info = read_info(source)
+    calibration, calibration_fit_error, inverse_calibration_fit_error = native_qct_calibration(source, source_info)
     work_context = tempfile.TemporaryDirectory(prefix="geotiff-qct-")
     work = Path(work_context.name)
     try:
-        warped = work / "wgs84.vrt"
-        png = work / "wgs84.png"
-        # Nearest-neighbour retains the source's discrete cartographic palette.
-        # Bilinear interpolation creates intermediate edge colours which must then
-        # be discarded by QCT's 128-colour palette.
-        run([require_program("gdalwarp"), "-of", "VRT", "-t_srs", "EPSG:4326",
-             "-r", "near", str(source), str(warped)])
-        info = read_info(warped)
-        values = info.get("geoTransform")
-        if not isinstance(values, list) or len(values) != 6:
-            raise ValueError("GDAL did not return an affine transform for the WGS-84 raster")
-        transform = GeoTransform(tuple(float(value) for value in values))
+        png = work / "source.png"
+        # Keep the original raster grid.  QCT's polynomials carry WGS-84
+        # calibration, so GDAL need not resample text, contours, or linework.
         run([require_program("gdal_translate"), "-of", "PNG", "-ot", "Byte",
-             str(warped), str(png)])
+             str(source), str(png)])
         with Image.open(png) as opened:
             indexed = quantize(opened)
         staged = destination.with_suffix(destination.suffix + ".tmp")
-        staged.write_bytes(qct_bytes(indexed, transform, source.name))
-        validation = validate_qct(staged, indexed, transform)
+        staged.write_bytes(qct_bytes(indexed, calibration, source.name))
+        validation = validate_qct(staged, indexed, calibration)
         staged.replace(destination)
         if validation_gpx is not None:
             validation_gpx.parent.mkdir(parents=True, exist_ok=True)
-            write_validation_gpx(validation_gpx, transform, indexed.width, indexed.height,
+            write_validation_gpx(validation_gpx, calibration, indexed.width, indexed.height,
                                  validation_grid)
         validation.update({
             "source": str(source),
             "source_sha256_before": source_hash,
             "source_sha256_after": sha256(source),
             "source_preserved": source_hash == sha256(source),
-            "source_pixel_dimensions": read_info(source).get("size"),
+            "source_pixel_dimensions": source_info.get("size"),
             "qct_pixel_dimensions": list(indexed.size),
             "qct_palette_entries": max(indexed.tobytes(), default=0) + 1,
-            "reprojection_resampling": "near",
-            "wgs84_geotransform": list(transform.values),
+            "raster_reprojection": "none; native source pixels retained",
+            "calibration_fit_max_abs_error_degrees": calibration_fit_error,
+            "inverse_calibration_fit_max_abs_error_pixels": inverse_calibration_fit_error,
             "output": str(destination),
             "validation_gpx": str(validation_gpx) if validation_gpx else None,
         })
@@ -617,7 +758,7 @@ class QuickChartTests(unittest.TestCase):
                          "QCT-check-r1-c1")
 
     def test_gdal_geotiff_end_to_end_when_available(self) -> None:
-        if not all(shutil.which(tool) for tool in ("gdal_translate", "gdalwarp", "gdalinfo")):
+        if not all(shutil.which(tool) for tool in ("gdal_translate", "gdaltransform", "gdalinfo")):
             self.skipTest("GDAL command-line programs are unavailable")
         with tempfile.TemporaryDirectory() as folder:
             folder_path = Path(folder)
@@ -631,6 +772,10 @@ class QuickChartTests(unittest.TestCase):
             report = convert_geotiff(tif, qct)
             self.assertTrue(report["source_preserved"])
             self.assertEqual(before, sha256(tif))
+            self.assertEqual(report["source_pixel_dimensions"], report["qct_pixel_dimensions"])
+            self.assertEqual(report["raster_reprojection"], "none; native source pixels retained")
+            self.assertLess(float(report["calibration_fit_max_abs_error_degrees"]), 1e-8)
+            self.assertLess(float(report["inverse_calibration_fit_max_abs_error_pixels"]), 0.01)
             self.assertTrue(qct.is_file())
 
 
@@ -639,7 +784,7 @@ def main(arguments: Iterable[str] | None = None) -> int:
     parser.add_argument("source", nargs="?", type=Path, help="input GeoTIFF")
     parser.add_argument("destination", nargs="?", type=Path, help="new QCT output")
     parser.add_argument("--overwrite", action="store_true", help="replace an existing output QCT")
-    parser.add_argument("--keep-work", action="store_true", help="retain temporary WGS-84 render files")
+    parser.add_argument("--keep-work", action="store_true", help="retain temporary source render files")
     parser.add_argument("--validation-gpx", nargs="?", const=Path("AUTO"), type=Path,
                         help="write named GPX georeferencing checkpoints; omit its path to use a sibling file")
     parser.add_argument("--validation-grid", type=int, default=3,
