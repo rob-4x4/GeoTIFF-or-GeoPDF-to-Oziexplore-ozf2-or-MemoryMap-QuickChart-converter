@@ -39,10 +39,11 @@ fixture:
 python .\geotiff_to_qct.py --test
 ```
 
-All seven tests must pass. These tests check RLE and pixel-packed tile
-encoding, non-dithered cartographic quantization, the symmetric interpolation
-matrix, binary layout, calibration coefficients, GPX checkpoint creation, and
-a small GeoTIFF end-to-end conversion.
+All eight tests must pass. These tests check RLE and pixel-packed tile
+encoding, non-dithered cartographic quantization, exact preservation of a
+small cartographic palette, the symmetric interpolation matrix, binary layout,
+calibration coefficients, GPX checkpoint creation, and a small GeoTIFF
+end-to-end conversion.
 
 ## One-fixture conversion proof
 

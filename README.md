@@ -37,8 +37,9 @@ bulk conversion.
 
 The converter aims to retain the source map's legibility as closely as legacy
 QCT permits: it uses nearest-neighbour reprojection to avoid inventing edge
-colours, all 128 QCT palette entries, no error-diffusion dithering, and a
-pre-calculated symmetric interpolation matrix for scaled views. The generated
+colours, all 128 QCT palette entries, palette coverage that preserves small
+source palettes exactly, no error-diffusion dithering, and a pre-calculated
+symmetric interpolation matrix for scaled views. The generated
 QCT may have different pixel dimensions because it is reprojected to WGS-84,
 but the source GeoTIFF is never resampled down deliberately.
 

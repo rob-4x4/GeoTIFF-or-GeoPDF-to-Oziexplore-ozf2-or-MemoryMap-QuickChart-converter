@@ -234,9 +234,12 @@ def quantize(image: Image.Image) -> Image.Image:
     Dithering is desirable for photographs but creates false coloured fringes around
     cartographic lines and text.  QCT maps are normally viewed at close range, so
     preserving solid map-feature colours is more important than simulated shades.
+    MAXCOVERAGE also preserves a small existing cartographic palette faithfully;
+    MEDIANCUT can substitute a source palette colour even when fewer than 128
+    colours are present.
     """
     rgb = image.convert("RGB")
-    return rgb.quantize(colors=MAX_COLOURS, method=Image.Quantize.MEDIANCUT,
+    return rgb.quantize(colors=MAX_COLOURS, method=Image.Quantize.MAXCOVERAGE,
                         dither=Image.Dither.NONE)
 
 
@@ -562,6 +565,19 @@ class QuickChartTests(unittest.TestCase):
         for row in range(1, source.height):
             self.assertEqual(pixels[row * source.width : (row + 1) * source.width], first_row)
         self.assertLessEqual(max(pixels) + 1, MAX_COLOURS)
+
+    def test_cartographic_palette_colours_are_preserved(self) -> None:
+        # A paletted USGS-style map with fewer than 128 colours must not have
+        # its white paper colour (or any other source colour) substituted.
+        colours = [(0, 0, 0), (255, 255, 255), (0, 151, 164), (203, 0, 23),
+                   (131, 66, 37), (201, 234, 157), (137, 51, 128),
+                   (167, 226, 226), (255, 184, 184), (218, 179, 214),
+                   (207, 164, 142)]
+        source = Image.new("RGB", (len(colours), 1))
+        source.putdata(colours)
+        indexed = quantize(source)
+        rendered = indexed.convert("RGB")
+        self.assertEqual([rendered.getpixel((x, 0)) for x in range(rendered.width)], colours)
 
     def test_interpolation_matrix_is_symmetric_and_preserves_identity(self) -> None:
         image = Image.new("RGB", (4, 1))
