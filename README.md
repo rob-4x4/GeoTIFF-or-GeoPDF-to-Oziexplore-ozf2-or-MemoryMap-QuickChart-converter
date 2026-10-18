@@ -75,6 +75,31 @@ is retained as a regression case, but its WGS-84 reprojection has a trapezoidal
 valid-data footprint with surrounding no-data and is not suitable for judging
 visual map quality.
 
+## Windows GUI
+
+For repeat or multi-map conversions on Windows, start the included graphical
+front end from the repository folder:
+
+```powershell
+python .\geotiff_qct_gui.py
+```
+
+Choose one or more GeoTIFF inputs and an output folder. The GUI writes one QCT
+per source file, plus the same JSON validation report created by the command
+line tool. It protects existing QCT and GPX files unless **Allow replacement**
+is deliberately selected. Source GeoTIFFs are never modified.
+
+By default it also writes 3 by 3 image-frame validation GPX files. Enable
+**projected-grid GPX checkpoints** only for projected, metre-based source maps
+such as MGA or UTM; choose 50,000 metres for a manageable Australian 1:250,000
+test overlay. The GUI shows individual success/failure reports so one unsuitable
+map does not hide the results for the rest of a batch. Inputs with identical
+file names must be sent to separate output folders to avoid QCT name collisions.
+
+The GUI is a thin interface over `geotiff_to_qct.py`; it does not contain a
+separate writer or change GDAL configuration. The same GDAL and Pillow
+requirements apply.
+
 ## One-map proof
 
 Run the automated tests first:
