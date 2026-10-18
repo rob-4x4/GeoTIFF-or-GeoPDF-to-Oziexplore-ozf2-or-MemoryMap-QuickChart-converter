@@ -13,6 +13,7 @@ proof/*
 *.qc3
 *.tif
 *.tiff
+*.pdf
 *.validation.gpx
 *.qct.validation.json
 test-output/

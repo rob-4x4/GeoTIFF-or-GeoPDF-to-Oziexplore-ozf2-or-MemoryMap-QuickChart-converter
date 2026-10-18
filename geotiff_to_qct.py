@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a GeoTIFF into an unencrypted legacy Memory-Map Quick Chart (.qct).
+"""Convert a GeoTIFF or GeoPDF into an unencrypted legacy Memory-Map Quick Chart (.qct).
 
 This is intentionally a standalone tool.  It calls GDAL to read source
 georeferencing and render a PNG while retaining the source raster grid; QCT
@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import shutil
 import struct
 import subprocess
@@ -678,9 +679,94 @@ def write_projected_grid_gpx(path: Path, source_wkt: str, source_transform: GeoT
     return len(points)
 
 
+def write_projected_grid_validation(source: Path, path: Path, spacing_metres: int) -> int:
+    """Create projected-grid checkpoints for a GDAL dataset with metre-based coordinates."""
+    info = read_info(source)
+    source_wkt = (info.get("coordinateSystem") or {}).get("wkt")
+    if not isinstance(source_wkt, str):
+        raise ValueError("source needs a defined coordinate system for projected-grid validation")
+    transform = GeoTransform(tuple(float(value) for value in info["geoTransform"]))
+    width, height = (int(value) for value in info["size"])
+    calibration, _, _ = native_qct_calibration(source, info)
+    return write_projected_grid_gpx(path, source_wkt, transform, width, height, spacing_metres)
+
+
+def pdf_page_datasets(source: Path) -> list[str]:
+    """Return GDAL dataset names for PDF pages, preserving GDAL's own naming."""
+    info = read_info(source)
+    subdatasets = (info.get("metadata") or {}).get("SUBDATASETS") or {}
+    names = [(key, value) for key, value in subdatasets.items()
+             if key.endswith("_NAME") and isinstance(value, str)]
+    if not names:
+        return [str(source)]
+    def page_key(item: tuple[str, str]) -> int:
+        match = re.search(r"SUBDATASET_(\d+)_NAME", item[0])
+        return int(match.group(1)) if match else 0
+    return [value for _, value in sorted(names, key=page_key)]
+
+
+def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int = 1,
+                   overwrite: bool = False, keep_work: bool = False,
+                   validation_gpx: Path | None = None, validation_grid: int = 3,
+                   projected_grid_gpx: Path | None = None,
+                   projected_grid_spacing: int = 50000) -> dict:
+    """Render one georeferenced PDF page to a temporary GeoTIFF, then create a QCT."""
+    source = source.resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    if source.suffix.lower() != ".pdf":
+        raise ValueError("GeoPDF conversion expects a .pdf input")
+    if dpi < 72 or dpi > 1200:
+        raise ValueError("GeoPDF DPI must be between 72 and 1200")
+    pages = pdf_page_datasets(source)
+    if not 1 <= page <= len(pages):
+        raise ValueError(f"GeoPDF page must be between 1 and {len(pages)}")
+    if projected_grid_gpx is not None and projected_grid_gpx.exists() and not overwrite:
+        raise FileExistsError(f"Refusing to overwrite existing GPX: {projected_grid_gpx}")
+    pdf_hash = sha256(source)
+    work_context = tempfile.TemporaryDirectory(prefix="geopdf-qct-")
+    work = Path(work_context.name)
+    try:
+        staged = work / "rendered-page.tif"
+        # Rasterise at an explicit DPI and retain GDAL's georeferencing in the staged TIFF.
+        run([require_program("gdal_translate"), "-oo", f"DPI={dpi}", "-of", "GTiff",
+             "-co", "TILED=YES", "-co", "COMPRESS=DEFLATE", pages[page - 1], str(staged)])
+        report = convert_geotiff(staged, destination, overwrite=overwrite, keep_work=keep_work,
+                                 validation_gpx=validation_gpx, validation_grid=validation_grid,
+                                 title=source.name)
+        staged_hash = sha256(staged)
+        projected_count: int | None = None
+        if projected_grid_gpx is not None:
+            projected_grid_gpx.parent.mkdir(parents=True, exist_ok=True)
+            projected_count = write_projected_grid_validation(staged, projected_grid_gpx,
+                                                               projected_grid_spacing)
+        report["source"] = str(source)
+        report["source_sha256_before"] = pdf_hash
+        report["source_sha256_after"] = sha256(source)
+        report["source_preserved"] = pdf_hash == sha256(source)
+        report["geopdf"] = {
+            "page": page,
+            "page_count": len(pages),
+            "dpi": dpi,
+            "staged_geotiff_sha256": staged_hash,
+            "staged_geotiff_pixel_dimensions": report["source_pixel_dimensions"],
+        }
+        report["projected_grid_gpx"] = str(projected_grid_gpx) if projected_grid_gpx else None
+        report["projected_grid_checkpoints"] = projected_count
+        destination.with_suffix(destination.suffix + ".validation.json").write_text(
+            json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        return report
+    finally:
+        if keep_work:
+            print(f"Retained GeoPDF staging directory: {work}")
+            work_context.cleanup = lambda: None  # type: ignore[method-assign]
+        else:
+            work_context.cleanup()
+
+
 def convert_geotiff(source: Path, destination: Path, *, overwrite: bool = False,
                     keep_work: bool = False, validation_gpx: Path | None = None,
-                    validation_grid: int = 3) -> dict:
+                    validation_grid: int = 3, title: str | None = None) -> dict:
     source = source.resolve()
     destination = destination.resolve()
     if not source.is_file():
@@ -706,7 +792,7 @@ def convert_geotiff(source: Path, destination: Path, *, overwrite: bool = False,
         with Image.open(png) as opened:
             indexed = quantize(opened)
         staged = destination.with_suffix(destination.suffix + ".tmp")
-        staged.write_bytes(qct_bytes(indexed, calibration, source.name))
+        staged.write_bytes(qct_bytes(indexed, calibration, title or source.name))
         validation = validate_qct(staged, indexed, calibration)
         staged.replace(destination)
         if validation_gpx is not None:
@@ -845,10 +931,38 @@ class QuickChartTests(unittest.TestCase):
             self.assertLess(float(report["inverse_calibration_fit_max_abs_error_pixels"]), 0.01)
             self.assertTrue(qct.is_file())
 
+    def test_geopdf_end_to_end_when_available(self) -> None:
+        if not all(shutil.which(tool) for tool in ("gdal_translate", "gdaltransform", "gdalinfo")):
+            self.skipTest("GDAL command-line programs are unavailable")
+        formats = subprocess.run([require_program("gdalinfo"), "--formats"], text=True,
+                                 capture_output=True, check=True).stdout
+        if not re.search(r"^\s*PDF\b", formats, re.MULTILINE):
+            self.skipTest("GDAL PDF driver is unavailable")
+        with tempfile.TemporaryDirectory() as folder:
+            folder_path = Path(folder)
+            ppm = folder_path / "source.ppm"
+            tif = folder_path / "source.tif"
+            pdf = folder_path / "source.pdf"
+            qct = folder_path / "result.qct"
+            grid = folder_path / "grid.gpx"
+            Image.new("RGB", (20, 18), (50, 100, 150)).save(ppm)
+            run([require_program("gdal_translate"), "-of", "GTiff", "-a_srs", "EPSG:32617",
+                 "-a_ullr", "500000", "4500000", "520000", "4482000", str(ppm), str(tif)])
+            run([require_program("gdal_translate"), "-of", "PDF", str(tif), str(pdf)])
+            before = sha256(pdf)
+            report = convert_geopdf(pdf, qct, dpi=72, projected_grid_gpx=grid,
+                                    projected_grid_spacing=10000)
+            self.assertTrue(report["source_preserved"])
+            self.assertEqual(before, sha256(pdf))
+            self.assertEqual(report["geopdf"]["dpi"], 72)
+            self.assertGreater(int(report["projected_grid_checkpoints"]), 0)
+            self.assertTrue(grid.is_file())
+            self.assertTrue(qct.is_file())
+
 
 def main(arguments: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source", nargs="?", type=Path, help="input GeoTIFF")
+    parser.add_argument("source", nargs="?", type=Path, help="input GeoTIFF or GeoPDF")
     parser.add_argument("destination", nargs="?", type=Path, help="new QCT output")
     parser.add_argument("--overwrite", action="store_true", help="replace an existing output QCT")
     parser.add_argument("--keep-work", action="store_true", help="retain temporary source render files")
@@ -860,6 +974,12 @@ def main(arguments: Iterable[str] | None = None) -> int:
                         help="write read-only checkpoints at source projected-grid intersections")
     parser.add_argument("--projected-grid-metres", type=int, default=50000,
                         help="metre spacing for --source-grid-gpx (default: 50000)")
+    parser.add_argument("--projected-grid-gpx", type=Path,
+                        help="write projected-grid checkpoints while converting")
+    parser.add_argument("--pdf-dpi", type=int, default=300,
+                        help="GeoPDF rasterisation DPI (72 to 1200; default: 300)")
+    parser.add_argument("--pdf-page", type=int, default=1,
+                        help="one-based GeoPDF page number (default: 1)")
     parser.add_argument("--test", action="store_true", help="run automated tests")
     args = parser.parse_args(arguments)
     if args.test:
@@ -869,6 +989,8 @@ def main(arguments: Iterable[str] | None = None) -> int:
         parser.error("source is required unless --test is used")
     if args.source_grid_gpx is not None and args.destination is None:
         source = args.source.resolve()
+        if source.suffix.lower() == ".pdf":
+            parser.error("GeoPDF grid validation requires a conversion destination; use --projected-grid-gpx")
         target = args.source_grid_gpx.resolve()
         if target.exists() and not args.overwrite:
             raise FileExistsError(f"Refusing to overwrite existing GPX: {target}")
@@ -891,9 +1013,26 @@ def main(arguments: Iterable[str] | None = None) -> int:
     gpx_path = args.validation_gpx
     if gpx_path == Path("AUTO"):
         gpx_path = args.destination.with_suffix(".validation.gpx")
-    report = convert_geotiff(args.source, args.destination, overwrite=args.overwrite,
-                             keep_work=args.keep_work, validation_gpx=gpx_path,
-                             validation_grid=args.validation_grid)
+    projected_path = args.projected_grid_gpx
+    if projected_path is not None and projected_path.exists() and not args.overwrite:
+        raise FileExistsError(f"Refusing to overwrite existing GPX: {projected_path}")
+    if args.source.suffix.lower() == ".pdf":
+        report = convert_geopdf(args.source, args.destination, dpi=args.pdf_dpi, page=args.pdf_page,
+                                overwrite=args.overwrite, keep_work=args.keep_work,
+                                validation_gpx=gpx_path, validation_grid=args.validation_grid,
+                                projected_grid_gpx=projected_path,
+                                projected_grid_spacing=args.projected_grid_metres)
+    else:
+        report = convert_geotiff(args.source, args.destination, overwrite=args.overwrite,
+                                 keep_work=args.keep_work, validation_gpx=gpx_path,
+                                 validation_grid=args.validation_grid)
+        if projected_path is not None:
+            projected_path.parent.mkdir(parents=True, exist_ok=True)
+            report["projected_grid_gpx"] = str(projected_path)
+            report["projected_grid_checkpoints"] = write_projected_grid_validation(
+                args.source, projected_path, args.projected_grid_metres)
+            args.destination.with_suffix(args.destination.suffix + ".validation.json").write_text(
+                json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))
     return 0
 

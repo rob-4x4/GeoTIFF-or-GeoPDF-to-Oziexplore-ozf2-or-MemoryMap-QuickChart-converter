@@ -21,8 +21,8 @@ from pathlib import Path
 from tkinter import BooleanVar, IntVar, StringVar, Tk, filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from geotiff_to_qct import (GeoTransform, convert_geotiff, native_qct_calibration,
-                            read_info, write_projected_grid_gpx)
+from geotiff_to_qct import (convert_geopdf, convert_geotiff,
+                            write_projected_grid_validation)
 
 
 APPLICATION_TITLE = "GeoTIFF QuickChart Converter"
@@ -85,11 +85,14 @@ class ConverterWindow:
         self.gdal_bin_directory = StringVar()
         self.gdal_status_text = StringVar(value="Checking GDAL…")
         self.gdal_ready = False
+        self.gdal_status: GdalStatus | None = None
         self.output_directory = StringVar()
         self.image_frame_gpx = BooleanVar(value=True)
         self.image_frame_grid = IntVar(value=3)
         self.projected_grid_gpx = BooleanVar(value=False)
         self.projected_grid_spacing = IntVar(value=50000)
+        self.pdf_dpi = IntVar(value=300)
+        self.pdf_page = IntVar(value=1)
         self.allow_overwrite = BooleanVar(value=False)
         self._build()
         self._refresh_gdal()
@@ -114,7 +117,7 @@ class ConverterWindow:
         ttk.Button(gdal, text="Refresh", command=self._refresh_gdal).grid(
             row=1, column=2, padx=(7, 0), pady=(7, 0))
 
-        ttk.Label(outer, text="Select GeoTIFF source maps", font=("Segoe UI", 11, "bold")).grid(
+        ttk.Label(outer, text="Select GeoTIFF or GeoPDF source maps", font=("Segoe UI", 11, "bold")).grid(
             row=1, column=0, sticky="w")
         files_frame = ttk.Frame(outer)
         files_frame.grid(row=2, column=0, sticky="nsew", pady=(4, 10))
@@ -122,7 +125,7 @@ class ConverterWindow:
         files_frame.rowconfigure(0, weight=1)
         self.file_list = ttk.Treeview(files_frame, columns=("file",), show="headings", height=8,
                                       selectmode="extended")
-        self.file_list.heading("file", text="GeoTIFF source file")
+        self.file_list.heading("file", text="GeoTIFF or GeoPDF source file")
         self.file_list.column("file", width=680, stretch=True)
         self.file_list.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(files_frame, orient="vertical", command=self.file_list.yview)
@@ -130,7 +133,7 @@ class ConverterWindow:
         self.file_list.configure(yscrollcommand=scrollbar.set)
         button_frame = ttk.Frame(files_frame)
         button_frame.grid(row=1, column=0, sticky="w", pady=(7, 0))
-        self.add_button = ttk.Button(button_frame, text="Add GeoTIFF files…", command=self._add_files)
+        self.add_button = ttk.Button(button_frame, text="Add map files…", command=self._add_files)
         self.add_button.grid(row=0, column=0, padx=(0, 6))
         self.remove_button = ttk.Button(button_frame, text="Remove selected", command=self._remove_selected)
         self.remove_button.grid(row=0, column=1, padx=(0, 6))
@@ -161,6 +164,12 @@ class ConverterWindow:
                     textvariable=self.projected_grid_spacing).grid(row=1, column=2, sticky="w", pady=(7, 0))
         ttk.Label(validation, text="Enable projected-grid checks only for projected metre-based maps such as MGA or UTM.").grid(
             row=2, column=0, columnspan=4, sticky="w", pady=(7, 0))
+        ttk.Label(validation, text="GeoPDF page:").grid(row=3, column=0, sticky="w", pady=(7, 0))
+        ttk.Spinbox(validation, from_=1, to=999, width=5, textvariable=self.pdf_page).grid(
+            row=3, column=1, sticky="w", pady=(7, 0))
+        ttk.Label(validation, text="rendering DPI:").grid(row=3, column=2, sticky="e", padx=(16, 4), pady=(7, 0))
+        ttk.Spinbox(validation, from_=72, to=1200, increment=25, width=6, textvariable=self.pdf_dpi).grid(
+            row=3, column=3, sticky="w", pady=(7, 0))
 
         action = ttk.Frame(outer)
         action.grid(row=5, column=0, sticky="ew")
@@ -177,7 +186,9 @@ class ConverterWindow:
 
     def _add_files(self) -> None:
         selected = filedialog.askopenfilenames(
-            title="Select GeoTIFF files", filetypes=[("GeoTIFF", "*.tif *.tiff"), ("All files", "*.*")])
+            title="Select GeoTIFF or GeoPDF files",
+            filetypes=[("Map files", "*.tif *.tiff *.pdf"), ("GeoTIFF", "*.tif *.tiff"),
+                       ("GeoPDF", "*.pdf"), ("All files", "*.*")])
         known = {path.resolve() for path in self.files}
         for name in selected:
             path = Path(name).resolve()
@@ -215,6 +226,7 @@ class ConverterWindow:
         # not modify Windows PATH, the registry, GDAL configuration, or any files.
         os.environ["PATH"] = (str(folder) + os.pathsep if folder else "") + self.original_path
         status = probe_gdal(folder)
+        self.gdal_status = status
         self.gdal_ready = status.ready
         self.gdal_status_text.set(status.message)
 
@@ -226,7 +238,11 @@ class ConverterWindow:
                                  "gdal_translate, and gdaltransform, then click Refresh.")
             return
         if not self.files:
-            messagebox.showerror(APPLICATION_TITLE, "Add at least one GeoTIFF source map.")
+            messagebox.showerror(APPLICATION_TITLE, "Add at least one GeoTIFF or GeoPDF source map.")
+            return
+        if any(source.suffix.lower() == ".pdf" for source in self.files) and not self.gdal_status.geopdf:
+            messagebox.showerror(APPLICATION_TITLE,
+                                 "GeoPDF input was selected, but the installed GDAL PDF driver is unavailable.")
             return
         if not self.output_directory.get().strip():
             messagebox.showerror(APPLICATION_TITLE, "Choose an output folder.")
@@ -238,10 +254,16 @@ class ConverterWindow:
         try:
             image_grid = int(self.image_frame_grid.get())
             projected_spacing = int(self.projected_grid_spacing.get())
+            pdf_dpi = int(self.pdf_dpi.get())
+            pdf_page = int(self.pdf_page.get())
             if not 2 <= image_grid <= 9:
                 raise ValueError("Image-frame checkpoints must be between 2 and 9 per side.")
             if projected_spacing <= 0:
                 raise ValueError("Projected-grid spacing must be a positive number of metres.")
+            if not 72 <= pdf_dpi <= 1200:
+                raise ValueError("GeoPDF rendering DPI must be between 72 and 1200.")
+            if pdf_page < 1:
+                raise ValueError("GeoPDF page must be 1 or greater.")
         except (TypeError, ValueError) as error:
             messagebox.showerror(APPLICATION_TITLE, str(error))
             return
@@ -258,11 +280,12 @@ class ConverterWindow:
         self.progress.configure(maximum=len(self.files), value=0)
         self._log(f"Starting {len(self.files)} map conversion(s) into: {output}")
         settings = (output, self.image_frame_gpx.get(), image_grid, self.projected_grid_gpx.get(),
-                    projected_spacing, self.allow_overwrite.get())
+                    projected_spacing, self.allow_overwrite.get(), pdf_dpi, pdf_page)
         threading.Thread(target=self._convert_all, args=(list(self.files), settings), daemon=True).start()
 
-    def _convert_all(self, sources: list[Path], settings: tuple[Path, bool, int, bool, int, bool]) -> None:
-        output, use_frame_gpx, frame_grid, use_projected_gpx, spacing, overwrite = settings
+    def _convert_all(self, sources: list[Path],
+                     settings: tuple[Path, bool, int, bool, int, bool, int, int]) -> None:
+        output, use_frame_gpx, frame_grid, use_projected_gpx, spacing, overwrite, pdf_dpi, pdf_page = settings
         planned = []
         for source in sources:
             destination = output / f"{source.stem}.qct"
@@ -281,29 +304,31 @@ class ConverterWindow:
             try:
                 destination = output / f"{source.stem}.qct"
                 frame_gpx = output / f"{source.stem}-checks.gpx" if use_frame_gpx else None
-                report = convert_geotiff(source, destination, overwrite=overwrite,
-                                         validation_gpx=frame_gpx, validation_grid=frame_grid)
-                projected_gpx: Path | None = None
-                projected_count: int | None = None
-                if use_projected_gpx:
-                    projected_gpx = output / f"{source.stem}-projected-grid-checks.gpx"
-                    if projected_gpx.exists() and not overwrite:
-                        raise FileExistsError(f"Refusing to overwrite existing GPX: {projected_gpx}")
-                    info = read_info(source)
-                    source_wkt = (info.get("coordinateSystem") or {}).get("wkt")
-                    if not isinstance(source_wkt, str):
-                        raise ValueError("source needs a defined coordinate system for projected-grid validation")
-                    transform = GeoTransform(tuple(float(value) for value in info["geoTransform"]))
-                    width, height = (int(value) for value in info["size"])
-                    calibration, _, _ = native_qct_calibration(source, info)
-                    projected_count = write_projected_grid_gpx(projected_gpx, source_wkt, transform,
-                                                               width, height, spacing)
+                projected_gpx = output / f"{source.stem}-projected-grid-checks.gpx" if use_projected_gpx else None
+                if source.suffix.lower() == ".pdf":
+                    report = convert_geopdf(source, destination, dpi=pdf_dpi, page=pdf_page,
+                                            overwrite=overwrite, validation_gpx=frame_gpx,
+                                            validation_grid=frame_grid, projected_grid_gpx=projected_gpx,
+                                            projected_grid_spacing=spacing)
+                    projected_count = report.get("projected_grid_checkpoints")
+                else:
+                    report = convert_geotiff(source, destination, overwrite=overwrite,
+                                             validation_gpx=frame_gpx, validation_grid=frame_grid)
+                    projected_count = None
+                    if projected_gpx is not None:
+                        projected_count = write_projected_grid_validation(source, projected_gpx, spacing)
+                        report["projected_grid_gpx"] = str(projected_gpx)
+                        report["projected_grid_checkpoints"] = projected_count
+                        destination.with_suffix(destination.suffix + ".validation.json").write_text(
+                            json.dumps(report, indent=2) + "\n", encoding="utf-8")
                 result = {"source": str(source), "qct": str(destination),
+                          "input_type": "GeoPDF" if source.suffix.lower() == ".pdf" else "GeoTIFF",
                           "frame_gpx": str(frame_gpx) if frame_gpx else None,
                           "projected_grid_gpx": str(projected_gpx) if projected_gpx else None,
                           "projected_grid_checkpoints": projected_count,
                           "source_preserved": report["source_preserved"],
-                          "qct_palette_entries": report["qct_palette_entries"]}
+                          "qct_palette_entries": report["qct_palette_entries"],
+                          "geopdf": report.get("geopdf")}
                 self.events.put(("success", (index, result)))
             except Exception as error:  # Surface one map failure without abandoning a batch.
                 self.events.put(("failure", (index, source, str(error), traceback.format_exc())))

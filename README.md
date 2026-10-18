@@ -3,8 +3,8 @@
 > **AI-generated code notice:** This repository contains AI-generated code.
 > Review, test, and validate it before using it with maps or other data.
 
-This is an experimental, standalone GeoTIFF-to-Quick Chart converter for a GDAL
-toolchain.  It preserves the input file and writes a newly generated,
+This is an experimental, standalone GeoTIFF/GeoPDF-to-Quick Chart converter for
+a GDAL toolchain. It preserves the input file and writes a newly generated,
 unencrypted, legacy Quick Chart v2 (`.qct`) map.
 
 It is not a replacement for Memory-Map Navigator and does not implement QC3,
@@ -17,6 +17,7 @@ or plug-in folders.
 
 - GDAL command-line tools on `PATH`: `gdal_translate`, `gdaltransform`, and
   `gdalinfo`.
+- For GeoPDF input, a GDAL PDF read backend such as Poppler or PDFium.
 - Python 3.10+ with Pillow.
 
 Install the Python dependency on another machine with:
@@ -84,7 +85,7 @@ front end from the repository folder:
 python .\geotiff_qct_gui.py
 ```
 
-Choose one or more GeoTIFF inputs and an output folder. The GUI writes one QCT
+Choose one or more GeoTIFF or GeoPDF inputs and an output folder. The GUI writes one QCT
 per source file, plus the same JSON validation report created by the command
 line tool. It protects existing QCT and GPX files unless **Allow replacement**
 is deliberately selected. Source GeoTIFFs are never modified.
@@ -107,6 +108,31 @@ file names must be sent to separate output folders to avoid QCT name collisions.
 The GUI is a thin interface over `geotiff_to_qct.py`; it does not contain a
 separate writer or change GDAL configuration. The same GDAL and Pillow
 requirements apply.
+
+### GeoPDF inputs
+
+The GUI also accepts `.pdf` files that GDAL identifies as georeferenced PDFs.
+Choose the applicable **GeoPDF page** and **rendering DPI** (300 is the default
+starting point). A GeoPDF is rasterised by GDAL into a temporary georeferenced
+GeoTIFF at that DPI, then processed by the normal tested QCT path. The temporary
+TIFF is deleted after conversion unless the command-line `--keep-work` option
+is used; the original PDF is never modified.
+
+The validation JSON records the original PDF hash, chosen page and DPI, the
+temporary raster dimensions and hash, and normal QCT validation results. PDF
+pages without GDAL-readable georeferencing, password-protected PDFs, or maps
+with unsuitable page/inset georeferencing are rejected rather than silently
+creating an uncalibrated QCT. Complete the same one-map Android GPX/grid proof
+before batch-converting a new publisher's PDFs.
+
+From the command line, for example:
+
+```powershell
+python .\geotiff_to_qct.py '<source-map.pdf>' '<output-directory>\map.qct' `
+  --pdf-page 1 --pdf-dpi 300 --validation-gpx `
+  --projected-grid-gpx '<output-directory>\map-projected-grid-checks.gpx' `
+  --projected-grid-metres 50000
+```
 
 ## One-map proof
 
@@ -158,7 +184,8 @@ whose units are metres, such as MGA and UTM.
 
 ## Rebuild from scratch
 
-1. Copy this folder to the machine that has GDAL and Python/Pillow.
+1. Copy this folder to the machine that has GDAL (including its GeoPDF backend
+   when PDFs are needed) and Python/Pillow.
 2. Confirm `gdaltransform --version`, `gdal_translate --version`, and
    `gdalinfo --version` work in the intended shell.
 3. Install Pillow into the Python environment if needed:
