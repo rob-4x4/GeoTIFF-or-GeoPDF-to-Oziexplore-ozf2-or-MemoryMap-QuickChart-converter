@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Convert a GeoTIFF into an unencrypted legacy Memory-Map Quick Chart (.qct).
 
-This is intentionally a standalone tool.  It calls GDAL only to reproject a
-source raster to WGS-84 and render an RGB PNG; QCT writing and validation are
-implemented here.  It does not read, decrypt, modify, or overwrite existing
-QCT/QC3 maps.
+This is intentionally a standalone tool.  It calls GDAL to read source
+georeferencing and render a PNG while retaining the source raster grid; QCT
+writing and validation are implemented here.  It does not read, decrypt,
+modify, or overwrite existing QCT/QC3 maps.
 """
 
 from __future__ import annotations
@@ -618,6 +618,66 @@ def write_validation_gpx(path: Path, transform: GeoTransform | QctCalibration, w
     ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
 
 
+def projected_grid_pixels(transform: GeoTransform, width: int, height: int,
+                          spacing_metres: int) -> list[tuple[int, int, int, int]]:
+    """Return source-pixel positions for whole projected-coordinate grid intersections."""
+    if spacing_metres <= 0:
+        raise ValueError("projected grid spacing must be positive")
+    a, b, c, d, e, f = transform.values
+    determinant = b * f - c * e
+    if abs(determinant) < 1e-30:
+        raise ValueError("source affine transform is singular")
+    corners = [(a + b * x + c * y, d + e * x + f * y)
+               for x, y in ((0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1))]
+    eastings = [point[0] for point in corners]
+    northings = [point[1] for point in corners]
+    first_easting = math.ceil(min(eastings) / spacing_metres) * spacing_metres
+    last_easting = math.floor(max(eastings) / spacing_metres) * spacing_metres
+    first_northing = math.ceil(min(northings) / spacing_metres) * spacing_metres
+    last_northing = math.floor(max(northings) / spacing_metres) * spacing_metres
+    points: list[tuple[int, int, int, int]] = []
+    for easting in range(first_easting, last_easting + 1, spacing_metres):
+        for northing in range(first_northing, last_northing + 1, spacing_metres):
+            delta_easting, delta_northing = easting - a, northing - d
+            x = (f * delta_easting - c * delta_northing) / determinant
+            y = (-e * delta_easting + b * delta_northing) / determinant
+            pixel_x, pixel_y = round(x), round(y)
+            if 0 <= pixel_x < width and 0 <= pixel_y < height:
+                points.append((easting, northing, pixel_x, pixel_y))
+    return points
+
+
+def write_projected_grid_gpx(path: Path, calibration: QctCalibration, source_transform: GeoTransform,
+                             width: int, height: int, spacing_metres: int) -> int:
+    """Write GPX waypoints at known projected-map grid intersections."""
+    points = projected_grid_pixels(source_transform, width, height, spacing_metres)
+    if not points:
+        raise ValueError("no projected grid intersections fall within the source raster")
+    namespace = "http://www.topografix.com/GPX/1/1"
+    ET.register_namespace("", namespace)
+    root = ET.Element(f"{{{namespace}}}gpx", {"version": "1.1", "creator": "GeoTIFF QuickChart Converter"})
+    metadata = ET.SubElement(root, f"{{{namespace}}}metadata")
+    ET.SubElement(metadata, f"{{{namespace}}}name").text = "QCT projected-grid validation checkpoints"
+    ET.SubElement(metadata, f"{{{namespace}}}desc").text = (
+        "Waypoints are placed on exact source projected-coordinate grid intersections. "
+        "Load with the converted QCT and confirm each waypoint lies on the matching printed grid crossing."
+    )
+    for easting, northing, x, y in points:
+        longitude, latitude = calibration.xy_to_lon_lat(x, y)
+        waypoint = ET.SubElement(root, f"{{{namespace}}}wpt", {
+            "lat": f"{latitude:.10f}", "lon": f"{longitude:.10f}",
+        })
+        label = f"QCT-grid-E{easting}-N{northing}"
+        ET.SubElement(waypoint, f"{{{namespace}}}name").text = label
+        ET.SubElement(waypoint, f"{{{namespace}}}desc").text = (
+            f"Source projected grid E={easting} m, N={northing} m; source pixel x={x}, y={y}. "
+            "It should be exactly on this printed map-grid intersection."
+        )
+        ET.SubElement(waypoint, f"{{{namespace}}}sym").text = "Waypoint"
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+    return len(points)
+
+
 def convert_geotiff(source: Path, destination: Path, *, overwrite: bool = False,
                     keep_work: bool = False, validation_gpx: Path | None = None,
                     validation_grid: int = 3) -> dict:
@@ -757,6 +817,13 @@ class QuickChartTests(unittest.TestCase):
         self.assertEqual(waypoints[0].findtext("{http://www.topografix.com/GPX/1/1}name"),
                          "QCT-check-r1-c1")
 
+    def test_projected_grid_points_are_inside_source(self) -> None:
+        transform = GeoTransform((1000, 10, 0, 5000, 0, -10))
+        points = projected_grid_pixels(transform, 100, 80, 250)
+        self.assertEqual(len(points), 16)
+        self.assertIn((1500, 4500, 50, 50), points)
+        self.assertTrue(all(0 <= x < 100 and 0 <= y < 80 for _, _, x, y in points))
+
     def test_gdal_geotiff_end_to_end_when_available(self) -> None:
         if not all(shutil.which(tool) for tool in ("gdal_translate", "gdaltransform", "gdalinfo")):
             self.skipTest("GDAL command-line programs are unavailable")
@@ -789,13 +856,35 @@ def main(arguments: Iterable[str] | None = None) -> int:
                         help="write named GPX georeferencing checkpoints; omit its path to use a sibling file")
     parser.add_argument("--validation-grid", type=int, default=3,
                         help="checkpoints per side for --validation-gpx (2 to 9; default: 3)")
+    parser.add_argument("--source-grid-gpx", type=Path,
+                        help="write read-only checkpoints at source projected-grid intersections")
+    parser.add_argument("--projected-grid-metres", type=int, default=50000,
+                        help="metre spacing for --source-grid-gpx (default: 50000)")
     parser.add_argument("--test", action="store_true", help="run automated tests")
     args = parser.parse_args(arguments)
     if args.test:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(QuickChartTests)
         return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
-    if args.source is None or args.destination is None:
-        parser.error("source and destination are required unless --test is used")
+    if args.source is None:
+        parser.error("source is required unless --test is used")
+    if args.source_grid_gpx is not None and args.destination is None:
+        source = args.source.resolve()
+        target = args.source_grid_gpx.resolve()
+        if target.exists() and not args.overwrite:
+            raise FileExistsError(f"Refusing to overwrite existing GPX: {target}")
+        info = read_info(source)
+        calibration, forward_error, inverse_error = native_qct_calibration(source, info)
+        transform = GeoTransform(tuple(float(value) for value in info["geoTransform"]))
+        width, height = (int(value) for value in info["size"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        count = write_projected_grid_gpx(target, calibration, transform, width, height,
+                                         args.projected_grid_metres)
+        print(json.dumps({"validation_gpx": str(target), "checkpoints": count,
+                          "calibration_fit_max_abs_error_degrees": forward_error,
+                          "inverse_calibration_fit_max_abs_error_pixels": inverse_error}, indent=2))
+        return 0
+    if args.destination is None:
+        parser.error("destination is required unless --test or --source-grid-gpx is used")
     gpx_path = args.validation_gpx
     if gpx_path == Path("AUTO"):
         gpx_path = args.destination.with_suffix(".validation.gpx")

@@ -98,15 +98,30 @@ pixel dimensions, palette-entry count, and polynomial-fit error.
 
 `--validation-gpx` writes a sibling `input.validation.gpx` file by default. It
 contains a 3 by 3 set of named WGS-84 waypoints covering the corners, centre,
-and edge/interior grid locations. Load this GPX overlay with the newly converted
-map in Memory-Map and compare the waypoint names and coordinates with the
-matching printed latitude/longitude or map-grid intersections. Use a denser
-grid only when the source map has enough labelled intersections:
+and edge/interior locations. Load this GPX overlay with the newly converted map
+in Memory-Map to confirm that the QCT and GPX share the same image-frame
+calibration. Use a denser grid only when the source map has enough detail:
 
 ```powershell
 python .\geotiff_to_qct.py '<source-geotiff.tif>' '<output-directory>\map.qct' `
   --validation-gpx '<output-directory>\map-checks.gpx' --validation-grid 5
 ```
+
+For the stronger, independent printed-grid check on a projected GeoTIFF, write
+waypoints at exact source grid intersections without recreating or changing the
+QCT. The Australian 1:250,000 maps use MGA metres; a 50 km spacing keeps the
+overlay manageable:
+
+```powershell
+python .\geotiff_to_qct.py '<source-geotiff.tif>' `
+  --source-grid-gpx '<output-directory>\map-projected-grid-checks.gpx' `
+  --projected-grid-metres 50000
+```
+
+Load this GPX with the existing QCT, then select several waypoints. Each
+`QCT-grid-E...-N...` waypoint must sit exactly on its matching printed easting /
+northing grid crossing. This option is for projected source coordinate systems
+whose units are metres, such as MGA and UTM.
 
 ## Rebuild from scratch
 
