@@ -51,6 +51,12 @@ SHA-256 hashes, test coverage, conversion commands, and the Android/Memory-Map
 acceptance procedure. Generated QCT, GPX, and JSON evidence remains ignored by
 Git.
 
+Use the DuBois Pennsylvania UTM fixture for the first Android visual acceptance
+test. The included `Argentina Range.tif` polar-stereographic Antarctic fixture
+is retained as a regression case, but its WGS-84 reprojection has a trapezoidal
+valid-data footprint with surrounding no-data and is not suitable for judging
+visual map quality.
+
 ## One-map proof
 
 Run the automated tests first:

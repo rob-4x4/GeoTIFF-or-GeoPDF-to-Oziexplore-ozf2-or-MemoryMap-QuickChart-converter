@@ -21,6 +21,15 @@ unless its redistribution rights have been independently verified.
 The fixtures total about 52 MiB. Generated conversion artefacts are not
 committed.
 
+## Polar-projection regression case
+
+`Argentina Range.tif` covers an Antarctic-area map in Polar Stereographic.
+When GDAL reprojects its rectangular source grid into WGS-84 latitude/longitude,
+the valid image footprint becomes trapezoidal inside a rectangular target extent.
+The resulting QCT can therefore contain surrounding black/no-data pixels and is
+visually poor for an Android map demonstration. Keep this fixture for regression
+coverage, but **do not use it as the Android visual acceptance map**.
+
 ## Automated checks
 
 Run the converter's built-in unit and GDAL integration tests before using a
@@ -36,25 +45,27 @@ end-to-end conversion.
 
 ## One-fixture conversion proof
 
-Start with the smallest fixture rather than converting every map. This creates
-new outputs only; it never overwrites the fixture.
+Start with the DuBois UTM fixture rather than converting every map. It is a
+better visual acceptance map because its local-area UTM reprojection remains
+close to rectangular. This creates new outputs only; it never overwrites the
+fixture.
 
 ```powershell
-$fixture = '.\test-data\fixtures\Argentina Range.tif'
-$proof = '.\test-output\argentina-range'
+$fixture = '.\test-data\fixtures\DuBois-PA-41078-A7-24k.tif'
+$proof = '.\test-output\dubois-pa'
 
 New-Item -ItemType Directory -Path $proof -Force | Out-Null
 $before = (Get-FileHash -LiteralPath $fixture -Algorithm SHA256).Hash
 
 python .\geotiff_to_qct.py `
   $fixture `
-  (Join-Path $proof 'argentina-range.qct') `
-  --validation-gpx (Join-Path $proof 'argentina-range-checks.gpx') `
+  (Join-Path $proof 'dubois-pa.qct') `
+  --validation-gpx (Join-Path $proof 'dubois-pa-checks.gpx') `
   --validation-grid 3
 
 $after = (Get-FileHash -LiteralPath $fixture -Algorithm SHA256).Hash
 $before -eq $after
-Get-Content (Join-Path $proof 'argentina-range.qct.validation.json') -Raw
+Get-Content (Join-Path $proof 'dubois-pa.qct.validation.json') -Raw
 ```
 
 Before continuing, the hash comparison must be `True`. The JSON must report
@@ -66,12 +77,12 @@ Before continuing, the hash comparison must be `True`. The JSON must report
 1. In Memory-Map Android, sign in and make sure the Navigator / Import Maps
    feature is active; it is required for third-party QCT maps.
 2. Start the app once, then close it. Connect the Android device to the PC.
-3. Copy only `argentina-range.qct` and `argentina-range-checks.gpx` from the
+3. Copy only `dubois-pa.qct` and `dubois-pa-checks.gpx` from the
    proof folder to `Download/Memory-Map/` on internal storage. Do not copy the
    source GeoTIFF or validation JSON to the device.
 4. Fully close and reopen Memory-Map. Open **Maps**, then **Maps Everywhere**;
    enable all map types if the QCT is not visible.
-5. Open/import `argentina-range-checks.gpx` as the overlay. It contains nine
+5. Open/import `dubois-pa-checks.gpx` as the overlay. It contains nine
    WGS-84 waypoints named `QCT-check-r#-c#`.
 6. Inspect every waypoint. Corner and centre points must land on the expected
    map-grid intersections or other identifiable features. Pan and zoom through
