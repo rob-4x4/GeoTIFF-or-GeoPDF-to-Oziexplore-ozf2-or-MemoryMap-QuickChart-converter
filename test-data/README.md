@@ -39,9 +39,10 @@ fixture:
 python .\geotiff_to_qct.py --test
 ```
 
-All four tests must pass. These tests check RLE encoding, binary layout,
-calibration coefficients, GPX checkpoint creation, and a small GeoTIFF
-end-to-end conversion.
+All seven tests must pass. These tests check RLE and pixel-packed tile
+encoding, non-dithered cartographic quantization, the symmetric interpolation
+matrix, binary layout, calibration coefficients, GPX checkpoint creation, and
+a small GeoTIFF end-to-end conversion.
 
 ## One-fixture conversion proof
 
@@ -70,7 +71,10 @@ Get-Content (Join-Path $proof 'dubois-pa.qct.validation.json') -Raw
 
 Before continuing, the hash comparison must be `True`. The JSON must report
 `source_preserved: true`, `pixel_round_trip: true`, and a zero (or negligible)
-`calibration_max_abs_error_degrees`.
+`calibration_max_abs_error_degrees`. It also records the source and QCT pixel
+dimensions, the number of QCT palette entries, and `reprojection_resampling`.
+The default must be `near`; this avoids false blended colours around the
+source's cartographic linework.
 
 ## Android / Memory-Map acceptance test
 
@@ -86,9 +90,13 @@ Before continuing, the hash comparison must be `True`. The JSON must report
    WGS-84 waypoints named `QCT-check-r#-c#`.
 6. Inspect every waypoint. Corner and centre points must land on the expected
    map-grid intersections or other identifiable features. Pan and zoom through
-   the full map; there must be no missing tiles, corrupt colours, or tile seams.
+   the full map; there must be no missing tiles, corrupt colours, coloured
+   fringes around text/contours, loss of readable linework, or tile seams.
 7. Keep a screenshot and the generated validation JSON as the acceptance
    evidence. Do not convert further maps until this one-map proof passes.
+   Regenerate QCTs made by earlier versions of this prototype before comparing
+   them: those earlier outputs used dithering and a placeholder scaled-view
+   interpolation table.
 
 Memory-Map's Android map-loading guidance is available at
 <https://memory-map.com/mm-android-help3/Loading_Your_Existing_Maps.htm>.

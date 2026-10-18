@@ -28,7 +28,9 @@ from PIL import Image
 
 
 TILE = 64
-MAX_COLOURS = 127  # 128 is reserved by the legacy on-disk RLE discriminator.
+# Legacy QCT has 128 usable palette entries (indices 0 through 127).  A tile
+# containing all 128 must use pixel packing, rather than run-length coding.
+MAX_COLOURS = 128
 HEADER_SIZE = 0x45A0
 MAGIC = 0x1423D5FF
 VERSION = 2
@@ -100,18 +102,28 @@ def reverse_six_bits(value: int) -> int:
 
 def palette_bits(colour_count: int) -> int:
     if not 1 <= colour_count <= MAX_COLOURS:
-        raise ValueError("QCT RLE supports 1 to 127 palette entries")
+        raise ValueError("QCT supports 1 to 128 palette entries")
     return max(0, math.ceil(math.log2(colour_count)))
+
+
+def subpalette_for(indices: bytes) -> tuple[list[int], dict[int, int]]:
+    """Return the tile-local palette in first-use order and its reverse lookup."""
+    subpalette: list[int] = []
+    lookup: dict[int, int] = {}
+    for colour in indices:
+        if colour >= MAX_COLOURS:
+            raise ValueError("QCT pixel references a palette entry outside 0..127")
+        if colour not in lookup:
+            lookup[colour] = len(subpalette)
+            subpalette.append(colour)
+    return subpalette, lookup
 
 
 def encode_rle(indices: bytes) -> bytes:
     """Encode exactly one interlaced 64x64 tile using legacy QCT RLE."""
-    subpalette: list[int] = []
-    lookup: dict[int, int] = {}
-    for colour in indices:
-        if colour not in lookup:
-            lookup[colour] = len(subpalette)
-            subpalette.append(colour)
+    subpalette, lookup = subpalette_for(indices)
+    if len(subpalette) > 127:
+        raise ValueError("QCT RLE supports at most 127 palette entries per tile")
     bits = palette_bits(len(subpalette))
     repeat_bits = 8 - bits
     maximum_repeat = (1 << repeat_bits) - 1
@@ -131,8 +143,24 @@ def encode_rle(indices: bytes) -> bytes:
     return bytes(result)
 
 
+def encode_pixel_packed(indices: bytes) -> bytes:
+    """Encode a tile with QCT's 32-bit-block pixel-packing representation."""
+    subpalette, lookup = subpalette_for(indices)
+    if not 2 <= len(subpalette) <= MAX_COLOURS:
+        raise ValueError("QCT pixel packing supports 2 to 128 palette entries per tile")
+    bits = palette_bits(len(subpalette))
+    pixels_per_word = 32 // bits
+    result = bytearray([256 - len(subpalette), *subpalette])
+    for start in range(0, len(indices), pixels_per_word):
+        word = 0
+        for offset, colour in enumerate(indices[start : start + pixels_per_word]):
+            word |= lookup[colour] << (offset * bits)
+        result.extend(struct.pack("<I", word))
+    return bytes(result)
+
+
 def decode_rle(encoded: bytes) -> bytes:
-    if not encoded or encoded[0] == 0 or encoded[0] > MAX_COLOURS:
+    if not encoded or encoded[0] == 0 or encoded[0] > 127:
         raise ValueError("not a legacy QCT RLE tile")
     palette_count = encoded[0]
     if len(encoded) < palette_count + 1:
@@ -154,10 +182,90 @@ def decode_rle(encoded: bytes) -> bytes:
     return bytes(decoded)
 
 
+def decode_pixel_packed(encoded: bytes) -> bytes:
+    if not encoded or not 128 <= encoded[0] <= 254:
+        raise ValueError("not a legacy QCT pixel-packed tile")
+    palette_count = 256 - encoded[0]
+    if len(encoded) < palette_count + 1:
+        raise ValueError("truncated QCT pixel-packed sub-palette")
+    subpalette = encoded[1 : 1 + palette_count]
+    bits = palette_bits(palette_count)
+    pixels_per_word = 32 // bits
+    packed = encoded[1 + palette_count :]
+    words = math.ceil(TILE * TILE / pixels_per_word)
+    if len(packed) != words * 4:
+        raise ValueError("invalid QCT pixel-packed tile size")
+    mask = (1 << bits) - 1
+    decoded = bytearray()
+    for start in range(0, len(packed), 4):
+        word = struct.unpack_from("<I", packed, start)[0]
+        for offset in range(pixels_per_word):
+            subpalette_index = (word >> (offset * bits)) & mask
+            if subpalette_index >= palette_count:
+                raise ValueError("invalid QCT pixel-packed sub-palette index")
+            decoded.append(subpalette[subpalette_index])
+            if len(decoded) == TILE * TILE:
+                return bytes(decoded)
+    raise ValueError("QCT pixel-packed tile does not expand to 4096 pixels")
+
+
+def encode_tile(indices: bytes) -> bytes:
+    """Use the smaller documented non-Huffman encoding for one QCT tile."""
+    subpalette, _ = subpalette_for(indices)
+    candidates = [encode_pixel_packed(indices)] if len(subpalette) >= 2 else []
+    if len(subpalette) <= 127:
+        candidates.append(encode_rle(indices))
+    return min(candidates, key=len)
+
+
+def decode_tile(encoded: bytes) -> bytes:
+    if not encoded:
+        raise ValueError("empty QCT tile")
+    if 1 <= encoded[0] <= 127:
+        return decode_rle(encoded)
+    if 128 <= encoded[0] <= 254:
+        return decode_pixel_packed(encoded)
+    raise ValueError("Huffman-compressed QCT tiles are not supported by this validator")
+
+
 def quantize(image: Image.Image) -> Image.Image:
+    """Make the 128-colour QCT palette without spatial colour dithering.
+
+    Dithering is desirable for photographs but creates false coloured fringes around
+    cartographic lines and text.  QCT maps are normally viewed at close range, so
+    preserving solid map-feature colours is more important than simulated shades.
+    """
     rgb = image.convert("RGB")
     return rgb.quantize(colors=MAX_COLOURS, method=Image.Quantize.MEDIANCUT,
-                        dither=Image.Dither.FLOYDSTEINBERG)
+                        dither=Image.Dither.NONE)
+
+
+def interpolation_matrix(indexed: Image.Image) -> bytes:
+    """Pre-calculate the documented 128 x 128 QCT palette blend matrix."""
+    if indexed.mode != "P":
+        raise ValueError("QCT interpolation requires a paletted image")
+    raw_palette = (indexed.getpalette() or []) + [0] * 768
+    palette = [tuple(raw_palette[index * 3 : index * 3 + 3])
+               for index in range(MAX_COLOURS)]
+    used = max(indexed.tobytes(), default=0) + 1
+    matrix = bytearray(MAX_COLOURS * MAX_COLOURS)
+    for row in range(MAX_COLOURS):
+        for column in range(MAX_COLOURS):
+            if row >= used or column >= used:
+                choice = 0
+            elif row == column:
+                choice = row
+            else:
+                left, right = palette[row], palette[column]
+                target = tuple(left[channel] + right[channel] for channel in range(3))
+                choice = min(
+                    range(used),
+                    key=lambda index: sum(
+                        (2 * palette[index][channel] - target[channel]) ** 2
+                        for channel in range(3)),
+                )
+            matrix[row * MAX_COLOURS + column] = choice
+    return bytes(matrix)
 
 
 def qct_bytes(indexed: Image.Image, transform: GeoTransform, title: str) -> bytes:
@@ -216,10 +324,7 @@ def qct_bytes(indexed: Image.Image, transform: GeoTransform, title: str) -> byte
         red, green, blue = raw_palette[index * 3 : index * 3 + 3]
         offset = 0x1A0 + index * 4
         result[offset : offset + 4] = bytes((blue, green, red, 0))
-    # A valid, neutral interpolation matrix: retain the second colour's index.
-    for row in range(128):
-        for column in range(128):
-            result[0x5A0 + row * 128 + column] = column
+    result[0x5A0 : 0x5A0 + MAX_COLOURS * MAX_COLOURS] = interpolation_matrix(indexed)
 
     outline = len(result)
     result.extend(b"\0" * (4 * 16))
@@ -249,7 +354,7 @@ def qct_bytes(indexed: Image.Image, transform: GeoTransform, title: str) -> byte
                 original_row = reverse_six_bits(stored_row)
                 interlaced[stored_row * TILE : (stored_row + 1) * TILE] = \
                     tile[original_row * TILE : (original_row + 1) * TILE]
-            encoded = encode_rle(bytes(interlaced))
+            encoded = encode_tile(bytes(interlaced))
             pointer_offset = HEADER_SIZE + 4 * (tile_y * tiles_wide + tile_x)
             to_little_u32(result, pointer_offset, len(result))
             result.extend(encoded)
@@ -286,7 +391,7 @@ def decode_qct(data: bytes) -> tuple[Image.Image, GeoTransform]:
                       if tile_number + 1 < total_tiles else len(data))
         if not HEADER_SIZE + total_tiles * 4 <= start < next_start <= len(data):
             raise ValueError("QCT image index contains invalid tile pointer")
-        interlaced = decode_rle(data[start:next_start])
+        interlaced = decode_tile(data[start:next_start])
         tile_x, tile_y = tile_number % tiles_wide, tile_number // tiles_wide
         for stored_row in range(TILE):
             destination_row = tile_y * TILE + reverse_six_bits(stored_row)
@@ -309,7 +414,7 @@ def validate_qct(qct: Path, expected: Image.Image | None = None,
         "qct_sha256": hashlib.sha256(data).hexdigest(),
         "qct_bytes": len(data),
         "decoded_size": list(decoded.size),
-        "format": "legacy QCT v2, unencrypted, RLE",
+        "format": "legacy QCT v2, unencrypted, RLE/pixel-packed tiles",
         "pixel_round_trip": None,
         "calibration_max_abs_error_degrees": None,
     }
@@ -383,8 +488,11 @@ def convert_geotiff(source: Path, destination: Path, *, overwrite: bool = False,
     try:
         warped = work / "wgs84.vrt"
         png = work / "wgs84.png"
+        # Nearest-neighbour retains the source's discrete cartographic palette.
+        # Bilinear interpolation creates intermediate edge colours which must then
+        # be discarded by QCT's 128-colour palette.
         run([require_program("gdalwarp"), "-of", "VRT", "-t_srs", "EPSG:4326",
-             "-r", "bilinear", str(source), str(warped)])
+             "-r", "near", str(source), str(warped)])
         info = read_info(warped)
         values = info.get("geoTransform")
         if not isinstance(values, list) or len(values) != 6:
@@ -407,6 +515,10 @@ def convert_geotiff(source: Path, destination: Path, *, overwrite: bool = False,
             "source_sha256_before": source_hash,
             "source_sha256_after": sha256(source),
             "source_preserved": source_hash == sha256(source),
+            "source_pixel_dimensions": read_info(source).get("size"),
+            "qct_pixel_dimensions": list(indexed.size),
+            "qct_palette_entries": max(indexed.tobytes(), default=0) + 1,
+            "reprojection_resampling": "near",
             "wgs84_geotransform": list(transform.values),
             "output": str(destination),
             "validation_gpx": str(validation_gpx) if validation_gpx else None,
@@ -429,6 +541,40 @@ class QuickChartTests(unittest.TestCase):
         for colours in (1, 2, 3, 4, 17, 64, 127):
             source = bytes(index % colours for index in range(TILE * TILE))
             self.assertEqual(decode_rle(encode_rle(source)), source)
+
+    def test_pixel_packing_round_trip_including_128_colours(self) -> None:
+        for colours in (2, 3, 17, 64, 127, 128):
+            source = bytes(index % colours for index in range(TILE * TILE))
+            encoded = encode_pixel_packed(source)
+            self.assertGreater(encoded[0], 127)
+            self.assertEqual(decode_pixel_packed(encoded), source)
+            self.assertEqual(decode_tile(encode_tile(source)), source)
+
+    def test_cartographic_quantization_has_no_dither_pattern(self) -> None:
+        # Every row describes the same grayscale edge.  Error diffusion would make
+        # the palette index pattern vary by row; map linework must remain solid.
+        source = Image.new("RGB", (256, 4))
+        source.putdata([(value, value, value)
+                        for _ in range(source.height) for value in range(source.width)])
+        indexed = quantize(source)
+        pixels = indexed.tobytes()
+        first_row = pixels[:source.width]
+        for row in range(1, source.height):
+            self.assertEqual(pixels[row * source.width : (row + 1) * source.width], first_row)
+        self.assertLessEqual(max(pixels) + 1, MAX_COLOURS)
+
+    def test_interpolation_matrix_is_symmetric_and_preserves_identity(self) -> None:
+        image = Image.new("RGB", (4, 1))
+        image.putdata([(0, 0, 0), (64, 64, 64), (160, 160, 160), (255, 255, 255)])
+        indexed = quantize(image)
+        matrix = interpolation_matrix(indexed)
+        used = max(indexed.tobytes()) + 1
+        for index in range(used):
+            self.assertEqual(matrix[index * MAX_COLOURS + index], index)
+        for row in range(used):
+            for column in range(used):
+                self.assertEqual(matrix[row * MAX_COLOURS + column],
+                                 matrix[column * MAX_COLOURS + row])
 
     def test_qct_binary_layout_pixels_and_calibration(self) -> None:
         image = Image.new("RGB", (73, 69))

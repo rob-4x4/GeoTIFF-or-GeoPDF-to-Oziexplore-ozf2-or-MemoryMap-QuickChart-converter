@@ -28,9 +28,26 @@ python -m pip install -r requirements.txt
 
 This is a **prototype**. Its automated checks verify the writer's binary
 layout, pixel round-trip, calibration coefficients, GPX waypoint generation,
-and a GDAL-backed GeoTIFF conversion. They do not prove that Memory-Map will
-import or render every generated QCT. Complete the one-map Navigator import
-check before any bulk conversion.
+the 128-colour pixel-packing path, the interpolation matrix, and a GDAL-backed
+GeoTIFF conversion. They do not prove that Memory-Map will import or render
+every generated QCT. Complete the one-map Navigator import check before any
+bulk conversion.
+
+### Image-quality policy
+
+The converter aims to retain the source map's legibility as closely as legacy
+QCT permits: it uses nearest-neighbour reprojection to avoid inventing edge
+colours, all 128 QCT palette entries, no error-diffusion dithering, and a
+pre-calculated symmetric interpolation matrix for scaled views. The generated
+QCT may have different pixel dimensions because it is reprojected to WGS-84,
+but the source GeoTIFF is never resampled down deliberately.
+
+Legacy QCT cannot reproduce every GeoTIFF compression scheme or every source
+colour. Treat a map as accepted only when labels, contours, linework, colours,
+tile boundaries, and the GPX checkpoints have passed an Android/Memory-Map
+visual check. Regenerate any QCT created by an earlier version of this
+prototype: it used dithering and a placeholder interpolation matrix, which can
+cause coloured fringes around map features.
 
 The GitHub workflow runs the complete test suite (including its GDAL integration
 test) on every push and pull request. Generated maps, GeoTIFFs, validation
@@ -75,7 +92,8 @@ python .\geotiff_to_qct.py `
 The converter refuses to overwrite an existing QCT unless `--overwrite` is
 explicitly supplied.  It writes a neighbouring `.validation.json` log containing
 source/output SHA-256 hashes, source-preservation confirmation, tile/pixel
-round-trip validation, and calibration-coefficient validation.
+round-trip validation, calibration-coefficient validation, source/QCT pixel
+dimensions, palette-entry count, and the resampling method used.
 
 `--validation-gpx` writes a sibling `input.validation.gpx` file by default. It
 contains a 3 by 3 set of named WGS-84 waypoints covering the corners, centre,
