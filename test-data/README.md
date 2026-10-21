@@ -24,11 +24,10 @@ committed.
 ## Polar-projection regression case
 
 `Argentina Range.tif` covers an Antarctic-area map in Polar Stereographic.
-When GDAL reprojects its rectangular source grid into WGS-84 latitude/longitude,
-the valid image footprint becomes trapezoidal inside a rectangular target extent.
-The resulting QCT can therefore contain surrounding black/no-data pixels and is
-visually poor for an Android map demonstration. Keep this fixture for regression
-coverage, but **do not use it as the Android visual acceptance map**.
+An earlier reprojection-based approach produced a trapezoidal valid image
+footprint with surrounding no-data. The current converter instead retains the
+native raster grid. Keep this fixture for regression coverage, and use DuBois
+for the initial Android visual acceptance test described below.
 
 ## Automated checks
 
@@ -39,18 +38,21 @@ fixture:
 python .\geotiff_to_qct.py --test
 ```
 
-All eight tests must pass. These tests check RLE and pixel-packed tile
+The suite currently contains ten tests. These check RLE and pixel-packed tile
 encoding, non-dithered cartographic quantization, exact preservation of a
 small cartographic palette, the symmetric interpolation matrix, binary layout,
-calibration coefficients, GPX checkpoint creation, and a small GeoTIFF
-end-to-end conversion.
+calibration coefficients, GPX checkpoint creation, and small GeoTIFF and
+GeoPDF end-to-end conversions. The GDAL integration tests may be skipped if
+required tools or drivers are unavailable; review the test output and do not
+count skipped tests as passes. The GeoPDF test requires GDAL PDF support.
 
 ## One-fixture conversion proof
 
 Start with the DuBois UTM fixture rather than converting every map. The
 converter retains its native raster grid and uses QCT calibration polynomials,
-so this is a good proof that text, contours, and other fine cartography retain
-their source pixels. This creates new outputs only; it never overwrites the
+so this is a useful test of text, contours, and other fine cartography. Palette
+quantization may change colours, so visual inspection is still necessary. This
+creates new outputs only; it never overwrites the
 fixture.
 
 ```powershell
@@ -92,8 +94,11 @@ were retained.
    enable all map types if the QCT is not visible.
 5. Open/import `dubois-pa-checks.gpx` as the overlay. It contains nine
    WGS-84 waypoints named `QCT-check-r#-c#`.
-6. Inspect every waypoint. Corner and centre points must land on the expected
-   map-grid intersections or other identifiable features. Pan and zoom through
+6. Inspect every waypoint against its expected position in the image frame.
+   These image-frame points are not necessarily printed map-grid intersections.
+   For an independent printed-grid comparison, generate projected-grid GPX
+   checkpoints as described in the main README and compare their easting and
+   northing with the corresponding printed crossings. Pan and zoom through
    the full map; there must be no missing tiles, corrupt colours, coloured
    fringes around text/contours, loss of readable linework, or tile seams.
 7. Keep a screenshot and the generated validation JSON as the acceptance

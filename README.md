@@ -9,8 +9,9 @@ unencrypted, legacy Quick Chart v2 (`.qct`) map.
 
 It is not a replacement for Memory-Map Navigator and does not implement QC3,
 licensing, DRM, encrypted maps, or existing-map conversion. It uses GDAL to
-derive WGS-84 calibration polynomials while retaining the input raster grid,
-then writes legacy QCT tiles itself. It does not modify installed GDAL binaries
+derive WGS-84 calibration polynomials while retaining the source raster grid,
+then writes legacy QCT tiles itself. GeoPDF pages are first rasterised at the
+chosen DPI. It does not modify installed GDAL binaries
 or plug-in folders.
 
 ## Requirements
@@ -30,19 +31,27 @@ python -m pip install -r requirements.txt
 
 This is a **prototype**. Its automated checks verify the writer's binary
 layout, pixel round-trip, calibration coefficients, GPX waypoint generation,
-the 128-colour pixel-packing path, the interpolation matrix, and a GDAL-backed
-GeoTIFF conversion. They do not prove that Memory-Map will import or render
+the 128-colour pixel-packing path, the interpolation matrix, and GDAL-backed
+GeoTIFF and GeoPDF conversions when the required GDAL drivers are available.
+Skipped tests are not passes. These checks do not prove that Memory-Map will import or render
 every generated QCT. Complete the one-map Navigator import check before any
 bulk conversion.
+
+The Yarraloola GeoTIFF QCT and checkpoints have been visually checked in
+Memory-Map on Android. A two-page GeoPDF has also been converted successfully
+using page 1 at 300 DPI; its Memory-Map import and alignment have not yet been
+confirmed. These results do not establish compatibility with every source map.
 
 ### Image-quality policy
 
 The converter aims to retain the source map's legibility as closely as legacy
-QCT permits: it retains the original raster dimensions and pixel glyphs,
-uses QCT's third-order WGS-84 calibration polynomials, supports all 128 QCT
+QCT permits: it retains the GeoTIFF raster dimensions, uses QCT's third-order
+WGS-84 calibration polynomials, supports all 128 QCT
 palette entries, preserves small source palettes exactly, uses no
 error-diffusion dithering, and generates a symmetric interpolation matrix for
-scaled views. No raster reprojection or resampling is performed.
+scaled views. GeoPDF pages are rendered at the selected DPI before conversion;
+the resulting raster is not reprojected or resampled by the QCT conversion.
+Maps with more than 128 colours are quantized, so individual colours may change.
 
 Legacy QCT cannot reproduce every GeoTIFF compression scheme or every source
 colour. Treat a map as accepted only when labels, contours, linework, colours,
@@ -51,8 +60,9 @@ visual check. Regenerate any QCT created by an earlier version of this
 prototype: it used dithering and a placeholder interpolation matrix, which can
 cause coloured fringes around map features.
 
-The GitHub workflow runs the complete test suite (including its GDAL integration
-test) on every push and pull request. Generated maps, GeoTIFFs, validation
+The GitHub workflow runs the test suite on every push and pull request; GDAL
+integration tests can be skipped if their required tools or drivers are missing.
+Generated maps, GeoTIFFs, validation
 logs, and GPX outputs are deliberately excluded from Git to avoid publishing
 private/licensed maps or growing the repository with large binary outputs.
 
@@ -72,9 +82,9 @@ Git.
 
 Use the DuBois Pennsylvania UTM fixture for the first Android visual acceptance
 test. The included `Argentina Range.tif` polar-stereographic Antarctic fixture
-is retained as a regression case, but its WGS-84 reprojection has a trapezoidal
-valid-data footprint with surrounding no-data and is not suitable for judging
-visual map quality.
+is retained as a regression case; an earlier reprojection-based approach gave
+it a trapezoidal footprint with surrounding no-data. The current converter
+retains the native raster grid instead.
 
 ## Windows GUI
 
@@ -88,11 +98,11 @@ python .\geotiff_qct_gui.py
 Choose one or more GeoTIFF or GeoPDF inputs and an output folder. The GUI writes one QCT
 per source file, plus the same JSON validation report created by the command
 line tool. It protects existing QCT and GPX files unless **Allow replacement**
-is deliberately selected. Source GeoTIFFs are never modified.
+is deliberately selected. Source GeoTIFFs and GeoPDFs are never modified.
 
 At startup the **GDAL readiness** panel checks that `gdalinfo`,
 `gdal_translate`, and `gdaltransform` can run, that the GeoTIFF driver is
-available, and whether the GeoPDF driver is present for future GeoPDF support.
+available, and whether the GeoPDF driver is present for GeoPDF conversion.
 If GDAL is not on `PATH`, use **Choose GDAL bin folder…** and select the folder
 containing those programs. This setting applies only to the open GUI session;
 it does not edit Windows environment variables, the registry, or GDAL
@@ -120,10 +130,12 @@ is used; the original PDF is never modified.
 
 The validation JSON records the original PDF hash, chosen page and DPI, the
 temporary raster dimensions and hash, and normal QCT validation results. PDF
-pages without GDAL-readable georeferencing, password-protected PDFs, or maps
-with unsuitable page/inset georeferencing are rejected rather than silently
-creating an uncalibrated QCT. Complete the same one-map Android GPX/grid proof
-before batch-converting a new publisher's PDFs.
+pages without usable GDAL-readable georeferencing or PDFs GDAL cannot open
+cannot be converted. A successful conversion does not establish that the chosen
+page, map frame, inset or source georeferencing is correct. Check the selected
+page and independently compare projected-grid checkpoints with printed grid
+crossings where applicable. Complete the one-map Android GPX/grid proof before
+batch-converting a new publisher's PDFs.
 
 From the command line, for example:
 
@@ -155,7 +167,8 @@ source/output SHA-256 hashes, source-preservation confirmation, tile/pixel
 round-trip validation, calibration-coefficient validation, the source/QCT
 pixel dimensions, palette-entry count, and polynomial-fit error.
 
-`--validation-gpx` writes a sibling `input.validation.gpx` file by default. It
+`--validation-gpx` writes a sibling named after the output QCT, for example
+`map.validation.gpx` for `map.qct`, by default. It
 contains a 3 by 3 set of named WGS-84 waypoints covering the corners, centre,
 and edge/interior locations. Load this GPX overlay with the newly converted map
 in Memory-Map to confirm that the QCT and GPX share the same image-frame
@@ -196,7 +209,7 @@ whose units are metres, such as MGA and UTM.
 
 ## Recovery and rollback
 
-The tool does not change source GeoTIFFs, GDAL configuration, or Memory-Map
-files.  Delete a newly generated QCT and its validation log if the import proof
-fails; the source GeoTIFF and its SHA-256 remain intact.  Keep the JSON log with
+The tool does not change source GeoTIFFs or GeoPDFs, GDAL configuration, or
+Memory-Map files. Delete a newly generated QCT and its validation log if the import proof
+fails; the source file remains intact. Keep the JSON log with
 any QCT accepted by Navigator as the conversion evidence.
