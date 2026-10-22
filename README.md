@@ -20,8 +20,8 @@ or plug-in folders.
   `gdalinfo`.
 - For GeoPDF input, a GDAL PDF read backend such as Poppler or PDFium.
 - Python 3.10+ with Pillow.
-- Optional for the GUI's container renderer: Podman Desktop with a running Podman
-  machine and the selected PDFium image already pulled locally.
+- Optional for the GUI's container renderer: Docker Desktop or Podman Desktop
+  with its engine running and the selected PDFium image already pulled locally.
 
 Install the Python dependency on another machine with:
 
@@ -98,8 +98,15 @@ python .\geotiff_qct_gui.py
 ```
 
 Or double-click **Start GeoTIFF QuickChart.cmd** in the project folder. It
-prefers the active Conda environment or the installed Miniconda base Python,
-and checks that Pillow imports before starting. It then tries Python on `PATH`.
+prefers the app's isolated environment if one was previously set up, then
+checks installed Python/Pillow and GDAL command-line tools. If prerequisites
+are missing, it offers to install an isolated environment under
+`%LOCALAPPDATA%\GeoTIFFQuickChart`; this does not alter system PATH or another
+Python/Conda installation. Setup downloads the official micromamba Windows
+package and installs Python 3.12, Pillow, GDAL, and the GDAL PDF plugin from
+conda-forge. It requires an internet connection and can take several minutes.
+Choosing **No** lets the GUI open with any usable existing Python, but
+conversions remain unavailable until GDAL is installed or selected in the GUI.
 If you keep Python somewhere else, set the `QUICKCHART_PYTHON` environment
 variable to its full `python.exe` path. The command window stays available
 while the GUI runs and pauses if startup fails so the error can be read.
@@ -125,22 +132,27 @@ containing those programs. This setting applies only to the open GUI session;
 it does not edit Windows environment variables, the registry, or GDAL
 configuration files.
 
-### Podman PDFium rendering (optional GUI mode)
+### Docker or Podman PDFium rendering (optional GUI mode)
 
-The GUI can use a Linux GDAL/PDFium image in Podman for GeoPDF page discovery
-and rasterisation. Choose **Podman PDFium** under **GeoPDF renderer** and leave
+The GUI can use a Linux GDAL/PDFium image in Docker or Podman for GeoPDF page
+discovery and rasterisation. Choose **Container PDFium** under **GeoPDF renderer** and leave
 the default image as `docker.io/maptiler/gdal:3.11-pdfium-py3.13` for the image
 used in the verified colour comparison. Click **Check image** before
-conversion. Podman must be on `PATH`, its machine must be running, and the
-image must already exist locally. The app checks the image without pulling or
-changing it; if needed, pull it yourself with:
+conversion. Docker or Podman must be on `PATH`, its engine must be running, and
+the image must already exist locally. The app checks the image without pulling
+or changing it. Docker is preferred when both engines have the image; otherwise
+the app tries Podman. If neither runtime is available, the readiness panel
+warns that container PDFium is unavailable. QuickChart never installs Docker
+or Podman. Pull the image manually using whichever engine you want:
 
 ```powershell
+docker pull docker.io/maptiler/gdal:3.11-pdfium-py3.13
+# Or, if using Podman:
 podman pull docker.io/maptiler/gdal:3.11-pdfium-py3.13
 ```
 
-For a GUI batch, the app starts one temporary, network-disabled container and
-reuses it for all selected GeoPDFs, then removes it when the batch ends. Each
+For a GUI batch, the app starts one temporary, network-disabled container with
+the selected engine and reuses it for all selected GeoPDFs, then removes it when the batch ends. Each
 distinct source folder is mounted read-only; a temporary work folder is mounted
 writable. The container runs only `gdalinfo` and `gdal_translate` for the PDFs.
 The rendered georeferenced TIFFs are processed by the existing Windows GDAL
@@ -149,7 +161,7 @@ The source PDFs are never modified. Each validation JSON records the selected
 renderer, image reference, and local image ID. The image ID helps identify the
 exact build used even if the tag later changes.
 
-Podman path sharing must allow access to the selected PDF folder and the
+Docker Desktop file sharing or Podman path sharing must allow access to the selected PDF folder and the
 temporary work folder. If container startup or mounting fails, the map is
 reported as failed and no alternate renderer is silently substituted. Start
 with one PDF and a new output folder, inspect the saved GeoTIFF/QCT and

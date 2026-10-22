@@ -23,8 +23,8 @@ from tkinter import BooleanVar, IntVar, StringVar, Tk, filedialog, messagebox, t
 from tkinter.scrolledtext import ScrolledText
 
 from geotiff_to_qct import (convert_geopdf, convert_geotiff,
-                            DEFAULT_PDFIUM_CONTAINER_IMAGE, PodmanPdfiumSession,
-                            probe_podman_pdfium,
+                            DEFAULT_PDFIUM_CONTAINER_IMAGE, ContainerPdfiumSession,
+                            container_runtime_status, probe_pdfium_container,
                             write_projected_grid_validation,
                             write_projected_grid_validation_from_geopdf)
 
@@ -105,6 +105,8 @@ class ConverterWindow:
         self.allow_overwrite = BooleanVar(value=False)
         self._build()
         self._refresh_gdal()
+        self.container_available, container_message = container_runtime_status()
+        self.container_status_text.set(container_message)
         self.root.after(100, self._poll_events)
 
     def _build(self) -> None:
@@ -128,7 +130,7 @@ class ConverterWindow:
             row=1, column=2, padx=(7, 0), pady=(7, 0))
         ttk.Label(gdal, text="GeoPDF renderer:").grid(row=2, column=0, sticky="w", pady=(7, 0))
         self.pdf_renderer_choice = ttk.Combobox(
-            gdal, textvariable=self.pdf_renderer, values=("Windows GDAL", "Podman PDFium"),
+            gdal, textvariable=self.pdf_renderer, values=("Windows GDAL", "Container PDFium"),
             state="readonly", width=18)
         self.pdf_renderer_choice.grid(row=3, column=0, sticky="ew", pady=(3, 0))
         self.pdfium_image_entry = ttk.Entry(gdal, textvariable=self.pdfium_image)
@@ -137,6 +139,9 @@ class ConverterWindow:
         self.pdfium_check_button.grid(row=3, column=2, padx=(7, 0), pady=(3, 0))
         ttk.Label(gdal, textvariable=self.pdfium_status_text).grid(
             row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.container_status_text = StringVar(value="Checking optional Docker/Podman availability…")
+        ttk.Label(gdal, textvariable=self.container_status_text).grid(
+            row=5, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
         ttk.Label(outer, text="Select GeoTIFF or GeoPDF source maps", font=("Segoe UI", 11, "bold")).grid(
             row=1, column=0, sticky="w")
@@ -260,7 +265,7 @@ class ConverterWindow:
         self.gdal_status_text.set(status.message)
 
     def _check_pdfium_image(self) -> None:
-        status = probe_podman_pdfium(self.pdfium_image.get())
+        status = probe_pdfium_container(self.pdfium_image.get())
         self.pdfium_status_text.set(status.message)
         if not status.ready:
             messagebox.showerror(APPLICATION_TITLE, status.message)
@@ -282,8 +287,8 @@ class ConverterWindow:
             messagebox.showerror(APPLICATION_TITLE,
                                  "GeoPDF input was selected, but the installed GDAL PDF driver is unavailable.")
             return
-        if has_pdf and renderer == "Podman PDFium":
-            status = probe_podman_pdfium(pdfium_image)
+        if has_pdf and renderer == "Container PDFium":
+            status = probe_pdfium_container(pdfium_image)
             self.pdfium_status_text.set(status.message)
             if not status.ready:
                 messagebox.showerror(APPLICATION_TITLE, status.message)
@@ -353,8 +358,8 @@ class ConverterWindow:
             messagebox.showerror(APPLICATION_TITLE,
                                  "GeoPDF input was selected, but the installed GDAL PDF driver is unavailable.")
             return
-        if pdf_sources and renderer == "Podman PDFium":
-            status = probe_podman_pdfium(pdfium_image)
+        if pdf_sources and renderer == "Container PDFium":
+            status = probe_pdfium_container(pdfium_image)
             self.pdfium_status_text.set(status.message)
             if not status.ready:
                 messagebox.showerror(APPLICATION_TITLE, status.message)
@@ -415,10 +420,10 @@ class ConverterWindow:
         pdf_sources = [source for source in sources if source.suffix.lower() == ".pdf"]
         pdfium_session = None
         pdfium_work_context = None
-        if renderer == "Podman PDFium" and pdf_sources:
+        if renderer == "Container PDFium" and pdf_sources:
             try:
                 pdfium_work_context = tempfile.TemporaryDirectory(prefix="quickchart-grid-pdfium-batch-")
-                pdfium_session = PodmanPdfiumSession(
+                pdfium_session = ContainerPdfiumSession(
                     pdfium_image, pdf_sources, Path(pdfium_work_context.name))
                 pdfium_session.__enter__()
             except Exception as error:
@@ -429,7 +434,7 @@ class ConverterWindow:
                         pass
                 if pdfium_work_context is not None:
                     pdfium_work_context.cleanup()
-                self.events.put(("batch_failure", f"Could not start the shared Podman PDFium container: {error}"))
+                self.events.put(("batch_failure", f"Could not start the shared PDFium container: {error}"))
                 self.events.put(("grid_finished", (0, len(sources), False, 0)))
                 return
 
@@ -448,7 +453,7 @@ class ConverterWindow:
                 if source.suffix.lower() == ".pdf":
                     count = write_projected_grid_validation_from_geopdf(
                         source, target, spacing, dpi=pdf_dpi, page=pdf_page,
-                        pdfium_container_image=(pdfium_image if renderer == "Podman PDFium"
+                        pdfium_container_image=(pdfium_image if renderer == "Container PDFium"
                                                 and pdfium_session is None else None),
                         pdfium_session=pdfium_session)
                 else:
@@ -512,10 +517,10 @@ class ConverterWindow:
         pdfium_session = None
         pdfium_work_context = None
         pdf_sources = [source for source in sources if source.suffix.lower() == ".pdf"]
-        if renderer == "Podman PDFium" and pdf_sources:
+        if renderer == "Container PDFium" and pdf_sources:
             try:
                 pdfium_work_context = tempfile.TemporaryDirectory(prefix="quickchart-pdfium-batch-")
-                pdfium_session = PodmanPdfiumSession(
+                pdfium_session = ContainerPdfiumSession(
                     pdfium_image, pdf_sources, Path(pdfium_work_context.name))
                 pdfium_session.__enter__()
             except Exception as error:
@@ -526,7 +531,7 @@ class ConverterWindow:
                         pass
                 if pdfium_work_context is not None:
                     pdfium_work_context.cleanup()
-                self.events.put(("batch_failure", f"Could not start the shared Podman PDFium container: {error}"))
+                self.events.put(("batch_failure", f"Could not start the shared PDFium container: {error}"))
                 self.events.put(("finished", (0, len(sources), False)))
                 return
         processed = 0
@@ -543,7 +548,7 @@ class ConverterWindow:
                                             validation_grid=frame_grid, projected_grid_gpx=projected_gpx,
                                             projected_grid_spacing=spacing,
                                             save_geotiff=output / f"{source.stem}.tif" if save_tiff else None,
-                                            pdfium_container_image=(pdfium_image if renderer == "Podman PDFium"
+                                            pdfium_container_image=(pdfium_image if renderer == "Container PDFium"
                                                                     and pdfium_session is None else None),
                                             pdfium_session=pdfium_session)
                     projected_count = report.get("projected_grid_checkpoints")

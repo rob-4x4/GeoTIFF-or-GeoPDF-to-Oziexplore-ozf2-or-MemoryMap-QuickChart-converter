@@ -79,10 +79,10 @@ class GuiOutputTests(unittest.TestCase):
             window.events = queue.Queue()
             window.stop_event = threading.Event()
             settings = (root, False, 3, False, 5000, False, 150, 1, False,
-                        "Podman PDFium", "example/gdal-pdfium:latest")
+                        "Container PDFium", "example/gdal-pdfium:latest")
             report = {"source_preserved": True, "qct_palette_entries": 128, "geopdf": {}}
 
-            with patch("geotiff_qct_gui.PodmanPdfiumSession") as session_type, \
+            with patch("geotiff_qct_gui.ContainerPdfiumSession") as session_type, \
                     patch("geotiff_qct_gui.convert_geopdf", return_value=report) as convert:
                 session = session_type.return_value
                 window._convert_all(maps, settings)

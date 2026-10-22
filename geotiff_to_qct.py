@@ -40,54 +40,91 @@ DEFAULT_PDFIUM_CONTAINER_IMAGE = "docker.io/maptiler/gdal:3.11-pdfium-py3.13"
 
 
 @dataclass(frozen=True)
-class PodmanPdfiumStatus:
+class ContainerPdfiumStatus:
     ready: bool
     image: str
     version: str
     message: str
+    engine: str = ""
 
 
-def probe_podman_pdfium(image: str = DEFAULT_PDFIUM_CONTAINER_IMAGE) -> PodmanPdfiumStatus:
-    """Check a locally available Podman image for GDAL's PDFium backend without pulling it."""
+def _container_candidates() -> list[tuple[str, str]]:
+    """Return installed container CLIs in preference order: Docker, then Podman."""
+    return [(engine, executable) for engine in ("docker", "podman")
+            if (executable := shutil.which(engine))]
+
+
+def container_runtime_status() -> tuple[bool, str]:
+    """Check whether Docker or Podman has a reachable server; never install either."""
+    candidates = _container_candidates()
+    if not candidates:
+        return False, ("WARNING: Docker and Podman are not available. PDFium container rendering is optional "
+                       "and will not be installed by QuickChart.")
+    failures = []
+    for engine, executable in candidates:
+        try:
+            result = subprocess.run([executable, "info"], text=True, capture_output=True, timeout=12)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            failures.append(f"{engine}: {error}")
+            continue
+        if result.returncode == 0:
+            if engine == "docker" and shutil.which("podman") is None:
+                return True, "Docker is available for optional PDFium rendering; Podman is not required."
+            if engine == "podman" and shutil.which("docker") is None:
+                return True, "Podman is available for optional PDFium rendering; Docker is not required."
+            return True, f"{engine.capitalize()} is available for optional PDFium rendering."
+        failures.append(f"{engine}: {(result.stderr.strip() or result.stdout.strip())[:240]}")
+    return False, "WARNING: No Docker or Podman server is available. " + "; ".join(failures)
+
+
+def probe_pdfium_container(image: str = DEFAULT_PDFIUM_CONTAINER_IMAGE) -> ContainerPdfiumStatus:
+    """Check a local Docker/Podman image for GDAL's PDFium backend without pulling it."""
     image = image.strip()
     if not image:
-        return PodmanPdfiumStatus(False, image, "", "Enter a Podman image name.")
-    podman = shutil.which("podman")
-    if not podman:
-        return PodmanPdfiumStatus(False, image, "", "Podman was not found on PATH.")
-    try:
-        exists = subprocess.run([podman, "image", "exists", image], text=True,
-                                capture_output=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return PodmanPdfiumStatus(False, image, "", f"Podman image check failed: {error}")
-    if exists.returncode:
-        return PodmanPdfiumStatus(
-            False, image, "", f"Image is not available locally: {image}. Pull it with Podman, then check again.")
-    try:
-        def run_in_image(*arguments: str) -> subprocess.CompletedProcess[str]:
-            return subprocess.run([podman, "run", "--rm", "--pull=never", "--network=none",
-                                   "--entrypoint=gdalinfo", image, *arguments],
-                                  text=True, capture_output=True, timeout=45)
+        return ContainerPdfiumStatus(False, image, "", "Enter a container image name.")
+    candidates = _container_candidates()
+    if not candidates:
+        return ContainerPdfiumStatus(False, image, "", "Docker and Podman were not found. Install a container "
+                                     "runtime separately; QuickChart will not install one.")
+    errors = []
+    for engine, executable in candidates:
+        try:
+            inspected = subprocess.run([executable, "image", "inspect", "--format", "{{.Id}}", image],
+                                       text=True, capture_output=True, timeout=20)
+            if inspected.returncode:
+                errors.append(f"{engine}: image unavailable locally")
+                continue
 
-        version_result = run_in_image("--version")
-        if version_result.returncode:
-            detail = version_result.stderr.strip() or version_result.stdout.strip()
-            return PodmanPdfiumStatus(False, image, "", f"Container GDAL check failed: {detail}")
-        version = version_result.stdout.strip() or version_result.stderr.strip()
-        pdf_result = run_in_image("--format", "PDF")
-        pdf_text = pdf_result.stdout + "\n" + pdf_result.stderr
-        if pdf_result.returncode or not re.search(r"HAVE_PDFIUM\s*=\s*YES", pdf_text, re.IGNORECASE):
-            detail = pdf_result.stderr.strip() or pdf_result.stdout.strip()
-            return PodmanPdfiumStatus(
-                False, image, version,
-                "The image does not report an enabled PDFium backend. " + detail)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return PodmanPdfiumStatus(False, image, "", f"Podman GDAL check failed: {error}")
-    return PodmanPdfiumStatus(True, image, version,
-                              f"Podman PDFium ready - {version} ({image}).")
+            def run_in_image(*arguments: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run([executable, "run", "--rm", "--pull=never", "--network=none",
+                                       "--entrypoint=gdalinfo", image, *arguments],
+                                      text=True, capture_output=True, timeout=45)
+
+            version_result = run_in_image("--version")
+            if version_result.returncode:
+                detail = version_result.stderr.strip() or version_result.stdout.strip()
+                errors.append(f"{engine}: container GDAL check failed: {detail}")
+                continue
+            version = version_result.stdout.strip() or version_result.stderr.strip()
+            pdf_result = run_in_image("--format", "PDF")
+            pdf_text = pdf_result.stdout + "\n" + pdf_result.stderr
+            if pdf_result.returncode or not re.search(r"HAVE_PDFIUM\s*=\s*YES", pdf_text, re.IGNORECASE):
+                detail = pdf_result.stderr.strip() or pdf_result.stdout.strip()
+                errors.append(f"{engine}: image does not report PDFium: {detail}")
+                continue
+        except (OSError, subprocess.TimeoutExpired) as error:
+            errors.append(f"{engine}: {error}")
+            continue
+        return ContainerPdfiumStatus(True, image, version,
+                                     f"{engine.capitalize()} PDFium ready - {version} ({image}).", engine)
+    return ContainerPdfiumStatus(False, image, "", "No usable local Docker/Podman image. " + "; ".join(errors))
 
 
-class PodmanPdfiumSession:
+PodmanPdfiumStatus = ContainerPdfiumStatus
+probe_podman_pdfium = probe_pdfium_container
+
+
+class ContainerPdfiumSession:
     """A container session for PDF inspection and rendering across a batch."""
 
     def __init__(self, image: str, sources: Path | Iterable[Path], work: Path) -> None:
@@ -105,7 +142,8 @@ class PodmanPdfiumSession:
             for index, directory in enumerate(self.source_directories)
         }
         self.work_directory = work.resolve()
-        self.podman = shutil.which("podman")
+        self.engine = ""
+        self.container_cli = ""
         self.name = "quickchart-pdfium-" + uuid.uuid4().hex[:12]
         self.started = False
         self.image_id: str | None = None
@@ -115,18 +153,25 @@ class PodmanPdfiumSession:
         # Podman Desktop translates forward-slash Windows paths for its WSL machine.
         return path.resolve().as_posix()
 
-    def __enter__(self) -> "PodmanPdfiumSession":
-        if not self.podman:
-            raise RuntimeError("Podman was not found on PATH.")
+    def __enter__(self) -> "ContainerPdfiumSession":
         if any(not directory.is_dir() for directory in self.source_directories) or not self.work_directory.is_dir():
-            raise RuntimeError("The source or temporary work folder is unavailable for Podman mounting.")
-        inspected = subprocess.run([self.podman, "image", "inspect", "--format", "{{.Id}}", self.image],
-                                   text=True, capture_output=True, timeout=30)
-        if inspected.returncode:
-            detail = inspected.stderr.strip() or inspected.stdout.strip() or "image is unavailable"
-            raise RuntimeError(f"Could not inspect the local Podman image: {detail}")
-        self.image_id = inspected.stdout.strip()
-        command = [self.podman, "run", "--detach", "--rm", "--pull=never", "--network=none",
+            raise RuntimeError("The source or temporary work folder is unavailable for container mounting.")
+        failures = []
+        for engine, executable in _container_candidates():
+            inspected = subprocess.run([executable, "image", "inspect", "--format", "{{.Id}}", self.image],
+                                       text=True, capture_output=True, timeout=30)
+            if inspected.returncode:
+                failures.append(f"{engine}: {inspected.stderr.strip() or 'image unavailable'}")
+                continue
+            self.engine, self.container_cli = engine, executable
+            self.image_id = inspected.stdout.strip()
+            break
+        if not self.container_cli:
+            if not failures:
+                raise RuntimeError("Docker and Podman were not found. Install a container runtime separately; "
+                                   "QuickChart will not install one.")
+            raise RuntimeError("The PDFium image is unavailable in Docker and Podman: " + "; ".join(failures))
+        command = [self.container_cli, "run", "--detach", "--rm", "--pull=never", "--network=none",
                    "--name", self.name]
         for directory, target in self.source_targets.items():
             command.extend(["--mount", f"type=bind,src={self._mount_source(directory)},target={target},ro"])
@@ -135,14 +180,14 @@ class PodmanPdfiumSession:
         completed = subprocess.run(command, text=True, capture_output=True, timeout=60)
         if completed.returncode:
             detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
-            raise RuntimeError(f"Could not start the Podman PDFium container: {detail}")
+            raise RuntimeError(f"Could not start the {self.engine.capitalize()} PDFium container: {detail}")
         self.started = True
         return self
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
-        if self.started and self.podman:
+        if self.started and self.container_cli:
             try:
-                removed = subprocess.run([self.podman, "rm", "--force", self.name],
+                removed = subprocess.run([self.container_cli, "rm", "--force", self.name],
                                          text=True, capture_output=True, timeout=30)
             except (OSError, subprocess.TimeoutExpired):
                 if exc_type is None:
@@ -150,7 +195,7 @@ class PodmanPdfiumSession:
             else:
                 if removed.returncode and exc_type is None:
                     detail = removed.stderr.strip() or removed.stdout.strip() or "no diagnostic"
-                    raise RuntimeError(f"Could not remove the temporary Podman container: {detail}")
+                    raise RuntimeError(f"Could not remove the temporary {self.engine.capitalize()} container: {detail}")
             finally:
                 self.started = False
 
@@ -158,7 +203,7 @@ class PodmanPdfiumSession:
         source = source.resolve()
         target = self.source_targets.get(source.parent)
         if target is None:
-            raise ValueError("Podman PDFium session can only read PDFs from its mounted source folders.")
+            raise ValueError("PDFium container session can only read PDFs from its mounted source folders.")
         return f"{target}/{source.name}"
 
     def work_path(self, path: Path) -> str:
@@ -166,17 +211,17 @@ class PodmanPdfiumSession:
         try:
             relative = path.relative_to(self.work_directory)
         except ValueError as error:
-            raise ValueError("Podman PDFium output must stay inside its temporary work folder.") from error
+            raise ValueError("PDFium container output must stay inside its temporary work folder.") from error
         return "/quickchart/work/" + relative.as_posix()
 
     def _exec(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        if not self.started or not self.podman:
-            raise RuntimeError("Podman PDFium session is not running.")
-        completed = subprocess.run([self.podman, "exec", self.name, *arguments],
+        if not self.started or not self.container_cli:
+            raise RuntimeError("PDFium container session is not running.")
+        completed = subprocess.run([self.container_cli, "exec", self.name, *arguments],
                                    text=True, capture_output=True, timeout=3600)
         if completed.returncode:
             detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
-            raise RuntimeError(f"Podman GDAL command failed ({arguments[0]}): {detail}")
+            raise RuntimeError(f"Container GDAL command failed ({arguments[0]}): {detail}")
         return completed
 
     def read_info(self, source: Path) -> dict:
@@ -188,6 +233,9 @@ class PodmanPdfiumSession:
         self._exec("gdal_translate", "-oo", f"DPI={dpi}", "-of", "GTiff",
                    "-co", "TILED=YES", "-co", "COMPRESS=DEFLATE",
                    dataset, self.work_path(destination))
+
+
+PodmanPdfiumSession = ContainerPdfiumSession
 
 
 @dataclass(frozen=True)
@@ -850,7 +898,7 @@ def write_projected_grid_validation(source: Path, path: Path, spacing_metres: in
 def write_projected_grid_validation_from_geopdf(
         source: Path, path: Path, spacing_metres: int, *, dpi: int = 300, page: int = 1,
         pdfium_container_image: str | None = None,
-        pdfium_session: PodmanPdfiumSession | None = None) -> int:
+        pdfium_session: ContainerPdfiumSession | None = None) -> int:
     """Render a GeoPDF page temporarily and create projected-grid checkpoints without a QCT."""
     source = source.resolve()
     if not source.is_file():
@@ -880,7 +928,7 @@ def write_projected_grid_validation_from_geopdf(
         work = Path(folder)
         staged = work / "rendered-page.tif"
         if pdfium_container_image:
-            with PodmanPdfiumSession(pdfium_container_image, source, work) as renderer:
+            with ContainerPdfiumSession(pdfium_container_image, source, work) as renderer:
                 pages = pdf_page_datasets(source, reader=renderer.read_info,
                                           dataset_name=renderer.dataset_path)
                 if not 1 <= page <= len(pages):
@@ -916,7 +964,7 @@ def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int
                    projected_grid_spacing: int = 50000,
                    save_geotiff: Path | None = None,
                    pdfium_container_image: str | None = None,
-                   pdfium_session: PodmanPdfiumSession | None = None) -> dict:
+                   pdfium_session: ContainerPdfiumSession | None = None) -> dict:
     """Render one georeferenced PDF page to a temporary GeoTIFF, then create a QCT."""
     source = source.resolve()
     if not source.is_file():
@@ -951,7 +999,7 @@ def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int
             pdfium_image_id = pdfium_session.image_id
         elif pdfium_container_image:
             # Standalone callers retain the convenient one-map container lifecycle.
-            with PodmanPdfiumSession(pdfium_container_image, source, work) as renderer:
+            with ContainerPdfiumSession(pdfium_container_image, source, work) as renderer:
                 pages = pdf_page_datasets(source, reader=renderer.read_info,
                                           dataset_name=renderer.dataset_path)
                 if not 1 <= page <= len(pages):
@@ -1007,8 +1055,9 @@ def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int
             "page": page,
             "page_count": len(pages),
             "dpi": dpi,
-            "renderer": ("Podman PDFium" if pdfium_session is not None or pdfium_container_image
+            "renderer": ("Container PDFium" if pdfium_session is not None or pdfium_container_image
                          else "Windows GDAL"),
+            "renderer_engine": (pdfium_session.engine if pdfium_session is not None else None),
             "renderer_image": (pdfium_session.image if pdfium_session is not None
                                else pdfium_container_image),
             "renderer_image_id": (pdfium_session.image_id if pdfium_session is not None
