@@ -93,6 +93,7 @@ class ConverterWindow:
         self.projected_grid_spacing = IntVar(value=50000)
         self.pdf_dpi = IntVar(value=300)
         self.pdf_page = IntVar(value=1)
+        self.save_geotiff = BooleanVar(value=False)
         self.allow_overwrite = BooleanVar(value=False)
         self._build()
         self._refresh_gdal()
@@ -146,8 +147,10 @@ class ConverterWindow:
         ttk.Entry(destination, textvariable=self.output_directory).grid(row=0, column=0, sticky="ew")
         ttk.Button(destination, text="Choose output folder…", command=self._choose_output).grid(
             row=0, column=1, padx=(7, 0))
-        ttk.Checkbutton(destination, text="Allow replacement of existing QCT and GPX files",
+        ttk.Checkbutton(destination, text="Allow replacement of existing output files",
                         variable=self.allow_overwrite).grid(row=1, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ttk.Checkbutton(destination, text="Also save GeoPDF pages as GeoTIFF (.tif)",
+                        variable=self.save_geotiff).grid(row=2, column=0, columnspan=2, sticky="w", pady=(7, 0))
 
         validation = ttk.LabelFrame(outer, text="Validation outputs", padding=8)
         validation.grid(row=4, column=0, sticky="ew", pady=(0, 10))
@@ -280,20 +283,28 @@ class ConverterWindow:
         self.progress.configure(maximum=len(self.files), value=0)
         self._log(f"Starting {len(self.files)} map conversion(s) into: {output}")
         settings = (output, self.image_frame_gpx.get(), image_grid, self.projected_grid_gpx.get(),
-                    projected_spacing, self.allow_overwrite.get(), pdf_dpi, pdf_page)
+                    projected_spacing, self.allow_overwrite.get(), pdf_dpi, pdf_page, self.save_geotiff.get())
         threading.Thread(target=self._convert_all, args=(list(self.files), settings), daemon=True).start()
 
     def _convert_all(self, sources: list[Path],
-                     settings: tuple[Path, bool, int, bool, int, bool, int, int]) -> None:
-        output, use_frame_gpx, frame_grid, use_projected_gpx, spacing, overwrite, pdf_dpi, pdf_page = settings
+                     settings: tuple[Path, bool, int, bool, int, bool, int, int, bool]) -> None:
+        output, use_frame_gpx, frame_grid, use_projected_gpx, spacing, overwrite, pdf_dpi, pdf_page, save_tiff = settings
         planned = []
         for source in sources:
             destination = output / f"{source.stem}.qct"
             planned.append(destination)
+            if save_tiff and source.suffix.lower() == ".pdf":
+                planned.append(output / f"{source.stem}.tif")
             if use_frame_gpx:
                 planned.append(output / f"{source.stem}-checks.gpx")
             if use_projected_gpx:
                 planned.append(output / f"{source.stem}-projected-grid-checks.gpx")
+        source_paths = {path.resolve() for path in sources}
+        conflicts = [path for path in planned if path.resolve() in source_paths]
+        if conflicts:
+            self.events.put(("preflight_failure", conflicts))
+            self.events.put(("finished", 0))
+            return
         existing = [path for path in planned if path.exists()]
         if existing and not overwrite:
             self.events.put(("preflight_failure", existing))
@@ -309,7 +320,8 @@ class ConverterWindow:
                     report = convert_geopdf(source, destination, dpi=pdf_dpi, page=pdf_page,
                                             overwrite=overwrite, validation_gpx=frame_gpx,
                                             validation_grid=frame_grid, projected_grid_gpx=projected_gpx,
-                                            projected_grid_spacing=spacing)
+                                            projected_grid_spacing=spacing,
+                                            save_geotiff=output / f"{source.stem}.tif" if save_tiff else None)
                     projected_count = report.get("projected_grid_checkpoints")
                 else:
                     report = convert_geotiff(source, destination, overwrite=overwrite,
@@ -328,6 +340,7 @@ class ConverterWindow:
                           "projected_grid_checkpoints": projected_count,
                           "source_preserved": report["source_preserved"],
                           "qct_palette_entries": report["qct_palette_entries"],
+                          "saved_geotiff": report.get("geopdf", {}).get("saved_geotiff"),
                           "geopdf": report.get("geopdf")}
                 self.events.put(("success", (index, result)))
             except Exception as error:  # Surface one map failure without abandoning a batch.

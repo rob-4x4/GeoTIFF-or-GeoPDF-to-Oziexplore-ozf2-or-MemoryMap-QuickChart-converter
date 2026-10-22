@@ -99,6 +99,11 @@ Choose one or more GeoTIFF or GeoPDF inputs and an output folder. The GUI writes
 per source file, plus the same JSON validation report created by the command
 line tool. It protects existing QCT and GPX files unless **Allow replacement**
 is deliberately selected. Source GeoTIFFs and GeoPDFs are never modified.
+Select **Also save GeoPDF pages as GeoTIFF (.tif)** to keep the rendered,
+georeferenced page alongside each QCT, at the selected page and DPI. Existing
+GeoTIFF outputs are protected unless replacement is enabled. The option applies
+to PDF inputs only; existing GeoTIFF inputs are not duplicated. These TIFFs may
+be large and should be tested in the intended application before batch use.
 
 At startup the **GDAL readiness** panel checks that `gdalinfo`,
 `gdal_translate`, and `gdaltransform` can run, that the GeoTIFF driver is
@@ -152,6 +157,7 @@ Run the automated tests first:
 
 ```powershell
 python .\geotiff_to_qct.py --test
+python -m unittest test_gui_outputs
 ```
 
 Then convert exactly one input, writing to a new folder:

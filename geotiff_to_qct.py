@@ -709,7 +709,8 @@ def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int
                    overwrite: bool = False, keep_work: bool = False,
                    validation_gpx: Path | None = None, validation_grid: int = 3,
                    projected_grid_gpx: Path | None = None,
-                   projected_grid_spacing: int = 50000) -> dict:
+                   projected_grid_spacing: int = 50000,
+                   save_geotiff: Path | None = None) -> dict:
     """Render one georeferenced PDF page to a temporary GeoTIFF, then create a QCT."""
     source = source.resolve()
     if not source.is_file():
@@ -723,6 +724,12 @@ def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int
         raise ValueError(f"GeoPDF page must be between 1 and {len(pages)}")
     if projected_grid_gpx is not None and projected_grid_gpx.exists() and not overwrite:
         raise FileExistsError(f"Refusing to overwrite existing GPX: {projected_grid_gpx}")
+    if save_geotiff is not None:
+        save_geotiff = save_geotiff.resolve()
+        if save_geotiff == source or save_geotiff == destination.resolve():
+            raise ValueError("GeoTIFF output must differ from the source and QCT output")
+        if save_geotiff.exists() and not overwrite:
+            raise FileExistsError(f"Refusing to overwrite existing GeoTIFF: {save_geotiff}")
     pdf_hash = sha256(source)
     work_context = tempfile.TemporaryDirectory(prefix="geopdf-qct-")
     work = Path(work_context.name)
@@ -740,6 +747,31 @@ def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int
             projected_grid_gpx.parent.mkdir(parents=True, exist_ok=True)
             projected_count = write_projected_grid_validation(staged, projected_grid_gpx,
                                                                projected_grid_spacing)
+        if save_geotiff is not None:
+            save_geotiff.parent.mkdir(parents=True, exist_ok=True)
+            if overwrite:
+                with tempfile.NamedTemporaryFile(prefix="geotiff-output-", suffix=".tmp",
+                                                 dir=save_geotiff.parent, delete=False) as temporary:
+                    temporary_path = Path(temporary.name)
+                    try:
+                        with staged.open("rb") as rendered:
+                            shutil.copyfileobj(rendered, temporary)
+                    except BaseException:
+                        temporary.close()
+                        temporary_path.unlink(missing_ok=True)
+                        raise
+                try:
+                    temporary_path.replace(save_geotiff)
+                finally:
+                    temporary_path.unlink(missing_ok=True)
+            else:
+                with staged.open("rb") as rendered, save_geotiff.open("xb") as output:
+                    try:
+                        shutil.copyfileobj(rendered, output)
+                    except BaseException:
+                        output.close()
+                        save_geotiff.unlink(missing_ok=True)
+                        raise
         report["source"] = str(source)
         report["source_sha256_before"] = pdf_hash
         report["source_sha256_after"] = sha256(source)
@@ -750,6 +782,7 @@ def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int
             "dpi": dpi,
             "staged_geotiff_sha256": staged_hash,
             "staged_geotiff_pixel_dimensions": report["source_pixel_dimensions"],
+            "saved_geotiff": str(save_geotiff) if save_geotiff is not None else None,
         }
         report["projected_grid_gpx"] = str(projected_grid_gpx) if projected_grid_gpx else None
         report["projected_grid_checkpoints"] = projected_count
@@ -945,19 +978,28 @@ class QuickChartTests(unittest.TestCase):
             pdf = folder_path / "source.pdf"
             qct = folder_path / "result.qct"
             grid = folder_path / "grid.gpx"
+            saved_tif = folder_path / "saved.tif"
             Image.new("RGB", (20, 18), (50, 100, 150)).save(ppm)
             run([require_program("gdal_translate"), "-of", "GTiff", "-a_srs", "EPSG:32617",
                  "-a_ullr", "500000", "4500000", "520000", "4482000", str(ppm), str(tif)])
             run([require_program("gdal_translate"), "-of", "PDF", str(tif), str(pdf)])
             before = sha256(pdf)
             report = convert_geopdf(pdf, qct, dpi=72, projected_grid_gpx=grid,
-                                    projected_grid_spacing=10000)
+                                    projected_grid_spacing=10000, save_geotiff=saved_tif)
             self.assertTrue(report["source_preserved"])
             self.assertEqual(before, sha256(pdf))
             self.assertEqual(report["geopdf"]["dpi"], 72)
             self.assertGreater(int(report["projected_grid_checkpoints"]), 0)
             self.assertTrue(grid.is_file())
             self.assertTrue(qct.is_file())
+            self.assertEqual(sha256(saved_tif), report["geopdf"]["staged_geotiff_sha256"])
+            self.assertEqual(read_info(saved_tif)["size"], report["source_pixel_dimensions"])
+            with self.assertRaises(FileExistsError):
+                convert_geopdf(pdf, folder_path / "other.qct", dpi=72, save_geotiff=saved_tif)
+            replacement = convert_geopdf(pdf, folder_path / "other.qct", dpi=72,
+                                         overwrite=True, save_geotiff=saved_tif)
+            self.assertEqual(sha256(saved_tif), replacement["geopdf"]["staged_geotiff_sha256"])
+            self.assertEqual(before, sha256(pdf))
 
 
 def main(arguments: Iterable[str] | None = None) -> int:
