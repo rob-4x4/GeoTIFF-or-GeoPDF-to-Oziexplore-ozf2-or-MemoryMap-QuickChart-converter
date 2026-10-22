@@ -20,6 +20,8 @@ or plug-in folders.
   `gdalinfo`.
 - For GeoPDF input, a GDAL PDF read backend such as Poppler or PDFium.
 - Python 3.10+ with Pillow.
+- Optional for the GUI's container renderer: Podman Desktop with a running Podman
+  machine and the selected PDFium image already pulled locally.
 
 Install the Python dependency on another machine with:
 
@@ -95,10 +97,20 @@ front end from the repository folder:
 python .\geotiff_qct_gui.py
 ```
 
+Or double-click **Start GeoTIFF QuickChart.cmd** in the project folder. It
+prefers the active Conda environment or the installed Miniconda base Python,
+and checks that Pillow imports before starting. It then tries Python on `PATH`.
+If you keep Python somewhere else, set the `QUICKCHART_PYTHON` environment
+variable to its full `python.exe` path. The command window stays available
+while the GUI runs and pauses if startup fails so the error can be read.
+
 Choose one or more GeoTIFF or GeoPDF inputs and an output folder. The GUI writes one QCT
 per source file, plus the same JSON validation report created by the command
 line tool. It protects existing QCT and GPX files unless **Allow replacement**
 is deliberately selected. Source GeoTIFFs and GeoPDFs are never modified.
+During a batch, **Stop after current map** lets the active map finish safely
+and prevents the remaining maps from starting. Any completed output is kept;
+unstarted maps can be run later by selecting them and starting another batch.
 Select **Also save GeoPDF pages as GeoTIFF (.tif)** to keep the rendered,
 georeferenced page alongside each QCT, at the selected page and DPI. Existing
 GeoTIFF outputs are protected unless replacement is enabled. The option applies
@@ -113,12 +125,52 @@ containing those programs. This setting applies only to the open GUI session;
 it does not edit Windows environment variables, the registry, or GDAL
 configuration files.
 
+### Podman PDFium rendering (optional GUI mode)
+
+The GUI can use a Linux GDAL/PDFium image in Podman for GeoPDF page discovery
+and rasterisation. Choose **Podman PDFium** under **GeoPDF renderer** and leave
+the default image as `docker.io/maptiler/gdal:3.11-pdfium-py3.13` for the image
+used in the verified colour comparison. Click **Check image** before
+conversion. Podman must be on `PATH`, its machine must be running, and the
+image must already exist locally. The app checks the image without pulling or
+changing it; if needed, pull it yourself with:
+
+```powershell
+podman pull docker.io/maptiler/gdal:3.11-pdfium-py3.13
+```
+
+For a GUI batch, the app starts one temporary, network-disabled container and
+reuses it for all selected GeoPDFs, then removes it when the batch ends. Each
+distinct source folder is mounted read-only; a temporary work folder is mounted
+writable. The container runs only `gdalinfo` and `gdal_translate` for the PDFs.
+The rendered georeferenced TIFFs are processed by the existing Windows GDAL
+and QuickChart code; GeoTIFF inputs continue to use the Windows GDAL toolchain.
+The source PDFs are never modified. Each validation JSON records the selected
+renderer, image reference, and local image ID. The image ID helps identify the
+exact build used even if the tag later changes.
+
+Podman path sharing must allow access to the selected PDF folder and the
+temporary work folder. If container startup or mounting fails, the map is
+reported as failed and no alternate renderer is silently substituted. Start
+with one PDF and a new output folder, inspect the saved GeoTIFF/QCT and
+calibration checkpoints, then proceed with a batch only after the result is
+accepted in the intended Android/Memory-Map app.
+
 By default it also writes 3 by 3 image-frame validation GPX files. Enable
 **projected-grid GPX checkpoints** only for projected, metre-based source maps
 such as MGA or UTM; choose 50,000 metres for a manageable Australian 1:250,000
 test overlay. The GUI shows individual success/failure reports so one unsuitable
 map does not hide the results for the rest of a batch. Inputs with identical
 file names must be sent to separate output folders to avoid QCT name collisions.
+If a map frame contains no exact crossing at the selected projected-grid interval,
+the converter still completes the QCT and other requested outputs, reports a
+warning with zero projected-grid checkpoints, and does not create an empty GPX.
+Use **Create grid GPX only** to generate or refresh projected-grid checkpoints
+for already converted maps without rebuilding their QCTs. Select the original
+GeoPDFs or GeoTIFFs (a QCT by itself does not retain the source projected CRS
+needed for this check); GeoPDFs are temporarily rendered with the selected
+renderer, page, and DPI. Existing GPX files are skipped unless replacement is
+enabled, so the action can safely fill in missing checkpoints in a prior batch.
 
 The GUI is a thin interface over `geotiff_to_qct.py`; it does not contain a
 separate writer or change GDAL configuration. The same GDAL and Pillow

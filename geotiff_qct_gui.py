@@ -14,6 +14,7 @@ import queue
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import traceback
 from dataclasses import dataclass
@@ -22,7 +23,10 @@ from tkinter import BooleanVar, IntVar, StringVar, Tk, filedialog, messagebox, t
 from tkinter.scrolledtext import ScrolledText
 
 from geotiff_to_qct import (convert_geopdf, convert_geotiff,
-                            write_projected_grid_validation)
+                            DEFAULT_PDFIUM_CONTAINER_IMAGE, PodmanPdfiumSession,
+                            probe_podman_pdfium,
+                            write_projected_grid_validation,
+                            write_projected_grid_validation_from_geopdf)
 
 
 APPLICATION_TITLE = "GeoTIFF QuickChart Converter"
@@ -81,11 +85,15 @@ class ConverterWindow:
         self.root.minsize(800, 600)
         self.files: list[Path] = []
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.stop_event = threading.Event()
         self.original_path = os.environ.get("PATH", "")
         self.gdal_bin_directory = StringVar()
         self.gdal_status_text = StringVar(value="Checking GDAL…")
         self.gdal_ready = False
         self.gdal_status: GdalStatus | None = None
+        self.pdf_renderer = StringVar(value="Windows GDAL")
+        self.pdfium_image = StringVar(value=DEFAULT_PDFIUM_CONTAINER_IMAGE)
+        self.pdfium_status_text = StringVar(value="Optional - not checked")
         self.output_directory = StringVar()
         self.image_frame_gpx = BooleanVar(value=True)
         self.image_frame_grid = IntVar(value=3)
@@ -111,12 +119,24 @@ class ConverterWindow:
         gdal = ttk.LabelFrame(outer, text="GDAL readiness", padding=8)
         gdal.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         gdal.columnconfigure(0, weight=1)
+        gdal.columnconfigure(1, weight=2)
         ttk.Label(gdal, textvariable=self.gdal_status_text).grid(row=0, column=0, columnspan=3, sticky="w")
         ttk.Entry(gdal, textvariable=self.gdal_bin_directory).grid(row=1, column=0, sticky="ew", pady=(7, 0))
         ttk.Button(gdal, text="Choose GDAL bin folder…", command=self._choose_gdal_folder).grid(
             row=1, column=1, padx=(7, 0), pady=(7, 0))
         ttk.Button(gdal, text="Refresh", command=self._refresh_gdal).grid(
             row=1, column=2, padx=(7, 0), pady=(7, 0))
+        ttk.Label(gdal, text="GeoPDF renderer:").grid(row=2, column=0, sticky="w", pady=(7, 0))
+        self.pdf_renderer_choice = ttk.Combobox(
+            gdal, textvariable=self.pdf_renderer, values=("Windows GDAL", "Podman PDFium"),
+            state="readonly", width=18)
+        self.pdf_renderer_choice.grid(row=3, column=0, sticky="ew", pady=(3, 0))
+        self.pdfium_image_entry = ttk.Entry(gdal, textvariable=self.pdfium_image)
+        self.pdfium_image_entry.grid(row=3, column=1, sticky="ew", padx=(7, 0), pady=(3, 0))
+        self.pdfium_check_button = ttk.Button(gdal, text="Check image", command=self._check_pdfium_image)
+        self.pdfium_check_button.grid(row=3, column=2, padx=(7, 0), pady=(3, 0))
+        ttk.Label(gdal, textvariable=self.pdfium_status_text).grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         ttk.Label(outer, text="Select GeoTIFF or GeoPDF source maps", font=("Segoe UI", 11, "bold")).grid(
             row=1, column=0, sticky="w")
@@ -178,9 +198,15 @@ class ConverterWindow:
         action.grid(row=5, column=0, sticky="ew")
         self.convert_button = ttk.Button(action, text="Convert selected maps", command=self._start_conversion)
         self.convert_button.grid(row=0, column=0, sticky="w")
+        self.grid_only_button = ttk.Button(action, text="Create grid GPX only",
+                                           command=self._start_grid_generation)
+        self.grid_only_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.stop_button = ttk.Button(action, text="Stop after current map", command=self._request_stop,
+                                      state="disabled")
+        self.stop_button.grid(row=0, column=2, sticky="w", padx=(8, 0))
         self.progress = ttk.Progressbar(action, mode="determinate")
-        self.progress.grid(row=0, column=1, sticky="ew", padx=(12, 0))
-        action.columnconfigure(1, weight=1)
+        self.progress.grid(row=0, column=3, sticky="ew", padx=(12, 0))
+        action.columnconfigure(3, weight=1)
 
         ttk.Label(outer, text="Results", font=("Segoe UI", 11, "bold")).grid(row=6, column=0, sticky="w", pady=(12, 0))
         self.results = ScrolledText(outer, height=11, wrap="word", state="disabled")
@@ -233,6 +259,12 @@ class ConverterWindow:
         self.gdal_ready = status.ready
         self.gdal_status_text.set(status.message)
 
+    def _check_pdfium_image(self) -> None:
+        status = probe_podman_pdfium(self.pdfium_image.get())
+        self.pdfium_status_text.set(status.message)
+        if not status.ready:
+            messagebox.showerror(APPLICATION_TITLE, status.message)
+
     def _start_conversion(self) -> None:
         self._refresh_gdal()
         if not self.gdal_ready:
@@ -243,10 +275,19 @@ class ConverterWindow:
         if not self.files:
             messagebox.showerror(APPLICATION_TITLE, "Add at least one GeoTIFF or GeoPDF source map.")
             return
-        if any(source.suffix.lower() == ".pdf" for source in self.files) and not self.gdal_status.geopdf:
+        has_pdf = any(source.suffix.lower() == ".pdf" for source in self.files)
+        renderer = self.pdf_renderer.get()
+        pdfium_image = self.pdfium_image.get().strip()
+        if has_pdf and renderer == "Windows GDAL" and not self.gdal_status.geopdf:
             messagebox.showerror(APPLICATION_TITLE,
                                  "GeoPDF input was selected, but the installed GDAL PDF driver is unavailable.")
             return
+        if has_pdf and renderer == "Podman PDFium":
+            status = probe_podman_pdfium(pdfium_image)
+            self.pdfium_status_text.set(status.message)
+            if not status.ready:
+                messagebox.showerror(APPLICATION_TITLE, status.message)
+                return
         if not self.output_directory.get().strip():
             messagebox.showerror(APPLICATION_TITLE, "Choose an output folder.")
             return
@@ -279,16 +320,173 @@ class ConverterWindow:
                                  f"These sources have the same output file name: {names}\n"
                                  "Convert them to separate output folders.")
             return
+        self.stop_event.clear()
         self._set_busy(True)
         self.progress.configure(maximum=len(self.files), value=0)
         self._log(f"Starting {len(self.files)} map conversion(s) into: {output}")
         settings = (output, self.image_frame_gpx.get(), image_grid, self.projected_grid_gpx.get(),
-                    projected_spacing, self.allow_overwrite.get(), pdf_dpi, pdf_page, self.save_geotiff.get())
+                    projected_spacing, self.allow_overwrite.get(), pdf_dpi, pdf_page,
+                    self.save_geotiff.get(), renderer, pdfium_image)
         threading.Thread(target=self._convert_all, args=(list(self.files), settings), daemon=True).start()
 
+    def _start_grid_generation(self) -> None:
+        self._refresh_gdal()
+        if not self.gdal_ready:
+            messagebox.showerror(APPLICATION_TITLE,
+                                 "GDAL is not ready. Select the folder containing gdalinfo, "
+                                 "gdal_translate, and gdaltransform, then click Refresh.")
+            return
+        if not self.files:
+            messagebox.showerror(APPLICATION_TITLE, "Add the original GeoTIFF or GeoPDF source maps first.")
+            return
+        pdf_sources = [source for source in self.files if source.suffix.lower() == ".pdf"]
+        other_sources = [source for source in self.files
+                         if source.suffix.lower() not in (".pdf", ".tif", ".tiff")]
+        if other_sources:
+            messagebox.showerror(APPLICATION_TITLE,
+                                 "Checkpoint-only generation accepts GeoTIFFs and GeoPDFs, not QCT files. "
+                                 "For maps without a saved GeoTIFF, select the original GeoPDF.")
+            return
+        renderer = self.pdf_renderer.get()
+        pdfium_image = self.pdfium_image.get().strip()
+        if pdf_sources and renderer == "Windows GDAL" and not self.gdal_status.geopdf:
+            messagebox.showerror(APPLICATION_TITLE,
+                                 "GeoPDF input was selected, but the installed GDAL PDF driver is unavailable.")
+            return
+        if pdf_sources and renderer == "Podman PDFium":
+            status = probe_podman_pdfium(pdfium_image)
+            self.pdfium_status_text.set(status.message)
+            if not status.ready:
+                messagebox.showerror(APPLICATION_TITLE, status.message)
+                return
+        if not self.output_directory.get().strip():
+            messagebox.showerror(APPLICATION_TITLE, "Choose an output folder for the projected-grid GPX files.")
+            return
+        try:
+            spacing = int(self.projected_grid_spacing.get())
+            pdf_dpi = int(self.pdf_dpi.get())
+            pdf_page = int(self.pdf_page.get())
+            if spacing <= 0:
+                raise ValueError("Projected-grid spacing must be a positive number of metres.")
+            if not 72 <= pdf_dpi <= 1200:
+                raise ValueError("GeoPDF rendering DPI must be between 72 and 1200.")
+            if pdf_page < 1:
+                raise ValueError("GeoPDF page must be 1 or greater.")
+        except (TypeError, ValueError) as error:
+            messagebox.showerror(APPLICATION_TITLE, str(error))
+            return
+        duplicate_stems = {source.stem for source in self.files if
+                           sum(candidate.stem == source.stem for candidate in self.files) > 1}
+        if duplicate_stems:
+            names = ", ".join(sorted(duplicate_stems))
+            messagebox.showerror(APPLICATION_TITLE,
+                                 f"These sources have the same output file name: {names}\n"
+                                 "Choose one source per map or use separate output folders.")
+            return
+        output = Path(self.output_directory.get()).expanduser().resolve()
+        existing = [output / f"{source.stem}-projected-grid-checks.gpx" for source in self.files
+                    if (output / f"{source.stem}-projected-grid-checks.gpx").exists()]
+        if self.allow_overwrite.get() and existing:
+            if not messagebox.askyesno(
+                    APPLICATION_TITLE,
+                    f"Replace {len(existing)} existing projected-grid GPX file(s)?\n\n"
+                    "Only these derived GPX files can change; QCTs, GeoTIFFs, and source maps are untouched. "
+                    "If a selected map has no crossing at the chosen spacing, its old GPX will be removed."):
+                return
+        self.stop_event.clear()
+        self._set_busy(True)
+        self.progress.configure(maximum=len(self.files), value=0)
+        self._log(f"Starting projected-grid GPX-only generation for {len(self.files)} map(s) into: {output}")
+        settings = (output, spacing, pdf_dpi, pdf_page, self.allow_overwrite.get(), renderer, pdfium_image)
+        threading.Thread(target=self._create_projected_grid_all,
+                         args=(list(self.files), settings), daemon=True).start()
+
+    def _create_projected_grid_all(self, sources: list[Path],
+                                   settings: tuple[Path, int, int, int, bool, str, str]) -> None:
+        output, spacing, pdf_dpi, pdf_page, overwrite, renderer, pdfium_image = settings
+        planned = [output / f"{source.stem}-projected-grid-checks.gpx" for source in sources]
+        source_paths = {path.resolve() for path in sources}
+        conflicts = [path for path in planned if path.resolve() in source_paths]
+        if conflicts:
+            self.events.put(("preflight_failure", conflicts))
+            self.events.put(("grid_finished", (0, len(sources), False, 0)))
+            return
+        output.mkdir(parents=True, exist_ok=True)
+        pdf_sources = [source for source in sources if source.suffix.lower() == ".pdf"]
+        pdfium_session = None
+        pdfium_work_context = None
+        if renderer == "Podman PDFium" and pdf_sources:
+            try:
+                pdfium_work_context = tempfile.TemporaryDirectory(prefix="quickchart-grid-pdfium-batch-")
+                pdfium_session = PodmanPdfiumSession(
+                    pdfium_image, pdf_sources, Path(pdfium_work_context.name))
+                pdfium_session.__enter__()
+            except Exception as error:
+                if pdfium_session is not None and pdfium_session.started:
+                    try:
+                        pdfium_session.__exit__(type(error), error, error.__traceback__)
+                    except Exception:
+                        pass
+                if pdfium_work_context is not None:
+                    pdfium_work_context.cleanup()
+                self.events.put(("batch_failure", f"Could not start the shared Podman PDFium container: {error}"))
+                self.events.put(("grid_finished", (0, len(sources), False, 0)))
+                return
+
+        processed = 0
+        skipped = 0
+        for index, source in enumerate(sources, start=1):
+            if self.stop_event.is_set():
+                break
+            target = output / f"{source.stem}-projected-grid-checks.gpx"
+            if target.exists() and not overwrite:
+                skipped += 1
+                processed += 1
+                self.events.put(("grid_skipped", (index, target)))
+                continue
+            try:
+                if source.suffix.lower() == ".pdf":
+                    count = write_projected_grid_validation_from_geopdf(
+                        source, target, spacing, dpi=pdf_dpi, page=pdf_page,
+                        pdfium_container_image=(pdfium_image if renderer == "Podman PDFium"
+                                                and pdfium_session is None else None),
+                        pdfium_session=pdfium_session)
+                else:
+                    count = write_projected_grid_validation(source, target, spacing)
+                warning = None
+                if count == 0:
+                    warning = (f"No projected-grid intersections were found at {spacing} m spacing; "
+                               "no new GPX was written.")
+                    if target.exists():
+                        if overwrite:
+                            target.unlink()
+                            warning += " The old GPX was removed to avoid leaving stale checkpoints."
+                        else:
+                            warning += " The existing GPX was left unchanged."
+                self.events.put(("grid_success", (index, {
+                    "source": str(source),
+                    "projected_grid_gpx": str(target) if count else None,
+                    "projected_grid_checkpoints": count,
+                    "spacing_metres": spacing,
+                    "warning": warning,
+                })))
+            except Exception as error:
+                self.events.put(("failure", (index, source, str(error), traceback.format_exc())))
+            processed += 1
+
+        if pdfium_session is not None:
+            try:
+                pdfium_session.__exit__(None, None, None)
+            except Exception as error:
+                self.events.put(("batch_failure", f"Could not clean up the shared PDFium container: {error}"))
+        if pdfium_work_context is not None:
+            pdfium_work_context.cleanup()
+        self.events.put(("grid_finished", (processed, len(sources), self.stop_event.is_set(), skipped)))
+
     def _convert_all(self, sources: list[Path],
-                     settings: tuple[Path, bool, int, bool, int, bool, int, int, bool]) -> None:
-        output, use_frame_gpx, frame_grid, use_projected_gpx, spacing, overwrite, pdf_dpi, pdf_page, save_tiff = settings
+                     settings: tuple[Path, bool, int, bool, int, bool, int, int, bool, str, str]) -> None:
+        (output, use_frame_gpx, frame_grid, use_projected_gpx, spacing, overwrite,
+         pdf_dpi, pdf_page, save_tiff, renderer, pdfium_image) = settings
         planned = []
         for source in sources:
             destination = output / f"{source.stem}.qct"
@@ -303,15 +501,38 @@ class ConverterWindow:
         conflicts = [path for path in planned if path.resolve() in source_paths]
         if conflicts:
             self.events.put(("preflight_failure", conflicts))
-            self.events.put(("finished", 0))
+            self.events.put(("finished", (0, len(sources), False)))
             return
         existing = [path for path in planned if path.exists()]
         if existing and not overwrite:
             self.events.put(("preflight_failure", existing))
-            self.events.put(("finished", 0))
+            self.events.put(("finished", (0, len(sources), False)))
             return
         output.mkdir(parents=True, exist_ok=True)
+        pdfium_session = None
+        pdfium_work_context = None
+        pdf_sources = [source for source in sources if source.suffix.lower() == ".pdf"]
+        if renderer == "Podman PDFium" and pdf_sources:
+            try:
+                pdfium_work_context = tempfile.TemporaryDirectory(prefix="quickchart-pdfium-batch-")
+                pdfium_session = PodmanPdfiumSession(
+                    pdfium_image, pdf_sources, Path(pdfium_work_context.name))
+                pdfium_session.__enter__()
+            except Exception as error:
+                if pdfium_session is not None and pdfium_session.started:
+                    try:
+                        pdfium_session.__exit__(type(error), error, error.__traceback__)
+                    except Exception:
+                        pass
+                if pdfium_work_context is not None:
+                    pdfium_work_context.cleanup()
+                self.events.put(("batch_failure", f"Could not start the shared Podman PDFium container: {error}"))
+                self.events.put(("finished", (0, len(sources), False)))
+                return
+        processed = 0
         for index, source in enumerate(sources, start=1):
+            if self.stop_event.is_set():
+                break
             try:
                 destination = output / f"{source.stem}.qct"
                 frame_gpx = output / f"{source.stem}-checks.gpx" if use_frame_gpx else None
@@ -321,7 +542,10 @@ class ConverterWindow:
                                             overwrite=overwrite, validation_gpx=frame_gpx,
                                             validation_grid=frame_grid, projected_grid_gpx=projected_gpx,
                                             projected_grid_spacing=spacing,
-                                            save_geotiff=output / f"{source.stem}.tif" if save_tiff else None)
+                                            save_geotiff=output / f"{source.stem}.tif" if save_tiff else None,
+                                            pdfium_container_image=(pdfium_image if renderer == "Podman PDFium"
+                                                                    and pdfium_session is None else None),
+                                            pdfium_session=pdfium_session)
                     projected_count = report.get("projected_grid_checkpoints")
                 else:
                     report = convert_geotiff(source, destination, overwrite=overwrite,
@@ -329,15 +553,21 @@ class ConverterWindow:
                     projected_count = None
                     if projected_gpx is not None:
                         projected_count = write_projected_grid_validation(source, projected_gpx, spacing)
-                        report["projected_grid_gpx"] = str(projected_gpx)
+                        report["projected_grid_gpx"] = str(projected_gpx) if projected_count else None
                         report["projected_grid_checkpoints"] = projected_count
+                        if projected_count == 0:
+                            report["projected_grid_warning"] = (
+                                f"No projected-grid intersections were found at {spacing} m spacing; "
+                                "the map was converted without a projected-grid GPX."
+                            )
                         destination.with_suffix(destination.suffix + ".validation.json").write_text(
                             json.dumps(report, indent=2) + "\n", encoding="utf-8")
                 result = {"source": str(source), "qct": str(destination),
                           "input_type": "GeoPDF" if source.suffix.lower() == ".pdf" else "GeoTIFF",
                           "frame_gpx": str(frame_gpx) if frame_gpx else None,
-                          "projected_grid_gpx": str(projected_gpx) if projected_gpx else None,
+                          "projected_grid_gpx": report.get("projected_grid_gpx"),
                           "projected_grid_checkpoints": projected_count,
+                          "projected_grid_warning": report.get("projected_grid_warning"),
                           "source_preserved": report["source_preserved"],
                           "qct_palette_entries": report["qct_palette_entries"],
                           "saved_geotiff": report.get("geopdf", {}).get("saved_geotiff"),
@@ -345,7 +575,15 @@ class ConverterWindow:
                 self.events.put(("success", (index, result)))
             except Exception as error:  # Surface one map failure without abandoning a batch.
                 self.events.put(("failure", (index, source, str(error), traceback.format_exc())))
-        self.events.put(("finished", len(sources)))
+            processed += 1
+        if pdfium_session is not None:
+            try:
+                pdfium_session.__exit__(None, None, None)
+            except Exception as error:
+                self.events.put(("batch_failure", f"Could not clean up the shared PDFium container: {error}"))
+        if pdfium_work_context is not None:
+            pdfium_work_context.cleanup()
+        self.events.put(("finished", (processed, len(sources), self.stop_event.is_set())))
 
     def _poll_events(self) -> None:
         try:
@@ -354,7 +592,19 @@ class ConverterWindow:
                 if kind == "success":
                     index, result = payload  # type: ignore[misc]
                     self.progress.configure(value=index)
+                    if result.get("projected_grid_warning"):
+                        self._log("WARNING: " + result["projected_grid_warning"])
                     self._log("SUCCESS\n" + json.dumps(result, indent=2))
+                elif kind == "grid_success":
+                    index, result = payload  # type: ignore[misc]
+                    self.progress.configure(value=index)
+                    if result.get("warning"):
+                        self._log("WARNING: " + result["warning"])
+                    self._log("GRID GPX RESULT\n" + json.dumps(result, indent=2))
+                elif kind == "grid_skipped":
+                    index, path = payload  # type: ignore[misc]
+                    self.progress.configure(value=index)
+                    self._log(f"SKIPPED (existing GPX protected): {path}")
                 elif kind == "failure":
                     index, source, message, details = payload  # type: ignore[misc]
                     self.progress.configure(value=index)
@@ -362,17 +612,44 @@ class ConverterWindow:
                 elif kind == "preflight_failure":
                     existing = "\n".join(str(path) for path in payload)  # type: ignore[union-attr]
                     self._log("NO FILES WERE CONVERTED. Existing output is protected:\n" + existing)
+                elif kind == "batch_failure":
+                    self._log(str(payload))
                 elif kind == "finished":
                     self._set_busy(False)
-                    self._log(f"Finished {payload} map conversion(s). Review the results above before import.")
+                    processed, total, stopped = payload  # type: ignore[misc]
+                    if stopped:
+                        self._log(f"Stopped after the current map. Processed {processed} of {total}; "
+                                  "remaining maps were not started.")
+                    else:
+                        self._log(f"Finished {processed} of {total} map conversion(s). "
+                                  "Review the results above before import.")
+                elif kind == "grid_finished":
+                    self._set_busy(False)
+                    processed, total, stopped, skipped = payload  # type: ignore[misc]
+                    if stopped:
+                        self._log(f"Stopped after the current map. Processed {processed} of {total}; "
+                                  "remaining maps were not started.")
+                    else:
+                        self._log(f"Finished projected-grid GPX generation for {processed} of {total} map(s). "
+                                  f"Skipped {skipped} existing GPX file(s).")
         except queue.Empty:
             pass
         self.root.after(100, self._poll_events)
 
     def _set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
-        for widget in (self.add_button, self.remove_button, self.clear_button, self.convert_button):
+        for widget in (self.add_button, self.remove_button, self.clear_button, self.convert_button,
+                       self.grid_only_button,
+                       self.pdfium_image_entry, self.pdfium_check_button):
             widget.configure(state=state)
+        self.stop_button.configure(state="normal" if busy and not self.stop_event.is_set() else "disabled")
+        self.pdf_renderer_choice.configure(state="disabled" if busy else "readonly")
+
+    def _request_stop(self) -> None:
+        if not self.stop_event.is_set():
+            self.stop_event.set()
+            self.stop_button.configure(state="disabled")
+            self._log("Stop requested. The current map will finish safely; no additional maps will start.")
 
     def _log(self, message: str) -> None:
         self.results.configure(state="normal")

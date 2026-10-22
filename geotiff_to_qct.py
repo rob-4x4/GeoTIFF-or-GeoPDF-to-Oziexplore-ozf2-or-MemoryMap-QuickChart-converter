@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,158 @@ MAX_COLOURS = 128
 HEADER_SIZE = 0x45A0
 MAGIC = 0x1423D5FF
 VERSION = 2
+DEFAULT_PDFIUM_CONTAINER_IMAGE = "docker.io/maptiler/gdal:3.11-pdfium-py3.13"
+
+
+@dataclass(frozen=True)
+class PodmanPdfiumStatus:
+    ready: bool
+    image: str
+    version: str
+    message: str
+
+
+def probe_podman_pdfium(image: str = DEFAULT_PDFIUM_CONTAINER_IMAGE) -> PodmanPdfiumStatus:
+    """Check a locally available Podman image for GDAL's PDFium backend without pulling it."""
+    image = image.strip()
+    if not image:
+        return PodmanPdfiumStatus(False, image, "", "Enter a Podman image name.")
+    podman = shutil.which("podman")
+    if not podman:
+        return PodmanPdfiumStatus(False, image, "", "Podman was not found on PATH.")
+    try:
+        exists = subprocess.run([podman, "image", "exists", image], text=True,
+                                capture_output=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return PodmanPdfiumStatus(False, image, "", f"Podman image check failed: {error}")
+    if exists.returncode:
+        return PodmanPdfiumStatus(
+            False, image, "", f"Image is not available locally: {image}. Pull it with Podman, then check again.")
+    try:
+        def run_in_image(*arguments: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run([podman, "run", "--rm", "--pull=never", "--network=none",
+                                   "--entrypoint=gdalinfo", image, *arguments],
+                                  text=True, capture_output=True, timeout=45)
+
+        version_result = run_in_image("--version")
+        if version_result.returncode:
+            detail = version_result.stderr.strip() or version_result.stdout.strip()
+            return PodmanPdfiumStatus(False, image, "", f"Container GDAL check failed: {detail}")
+        version = version_result.stdout.strip() or version_result.stderr.strip()
+        pdf_result = run_in_image("--format", "PDF")
+        pdf_text = pdf_result.stdout + "\n" + pdf_result.stderr
+        if pdf_result.returncode or not re.search(r"HAVE_PDFIUM\s*=\s*YES", pdf_text, re.IGNORECASE):
+            detail = pdf_result.stderr.strip() or pdf_result.stdout.strip()
+            return PodmanPdfiumStatus(
+                False, image, version,
+                "The image does not report an enabled PDFium backend. " + detail)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return PodmanPdfiumStatus(False, image, "", f"Podman GDAL check failed: {error}")
+    return PodmanPdfiumStatus(True, image, version,
+                              f"Podman PDFium ready - {version} ({image}).")
+
+
+class PodmanPdfiumSession:
+    """A container session for PDF inspection and rendering across a batch."""
+
+    def __init__(self, image: str, sources: Path | Iterable[Path], work: Path) -> None:
+        self.image = image.strip()
+        if isinstance(sources, Path):
+            source_directories = [sources.resolve().parent]
+        else:
+            source_directories = [Path(source).resolve().parent for source in sources]
+        self.source_directories = list(dict.fromkeys(source_directories))
+        if not self.source_directories:
+            raise ValueError("At least one GeoPDF source is required for a Podman session.")
+        self.source_targets = {
+            directory: ("/quickchart/input" if len(self.source_directories) == 1
+                        else f"/quickchart/input-{index}")
+            for index, directory in enumerate(self.source_directories)
+        }
+        self.work_directory = work.resolve()
+        self.podman = shutil.which("podman")
+        self.name = "quickchart-pdfium-" + uuid.uuid4().hex[:12]
+        self.started = False
+        self.image_id: str | None = None
+
+    @staticmethod
+    def _mount_source(path: Path) -> str:
+        # Podman Desktop translates forward-slash Windows paths for its WSL machine.
+        return path.resolve().as_posix()
+
+    def __enter__(self) -> "PodmanPdfiumSession":
+        if not self.podman:
+            raise RuntimeError("Podman was not found on PATH.")
+        if any(not directory.is_dir() for directory in self.source_directories) or not self.work_directory.is_dir():
+            raise RuntimeError("The source or temporary work folder is unavailable for Podman mounting.")
+        inspected = subprocess.run([self.podman, "image", "inspect", "--format", "{{.Id}}", self.image],
+                                   text=True, capture_output=True, timeout=30)
+        if inspected.returncode:
+            detail = inspected.stderr.strip() or inspected.stdout.strip() or "image is unavailable"
+            raise RuntimeError(f"Could not inspect the local Podman image: {detail}")
+        self.image_id = inspected.stdout.strip()
+        command = [self.podman, "run", "--detach", "--rm", "--pull=never", "--network=none",
+                   "--name", self.name]
+        for directory, target in self.source_targets.items():
+            command.extend(["--mount", f"type=bind,src={self._mount_source(directory)},target={target},ro"])
+        command.extend(["--mount", f"type=bind,src={self._mount_source(self.work_directory)},target=/quickchart/work,rw",
+                        "--entrypoint=/bin/sh", self.image, "-c", "while :; do sleep 3600; done"])
+        completed = subprocess.run(command, text=True, capture_output=True, timeout=60)
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
+            raise RuntimeError(f"Could not start the Podman PDFium container: {detail}")
+        self.started = True
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        if self.started and self.podman:
+            try:
+                removed = subprocess.run([self.podman, "rm", "--force", self.name],
+                                         text=True, capture_output=True, timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                if exc_type is None:
+                    raise
+            else:
+                if removed.returncode and exc_type is None:
+                    detail = removed.stderr.strip() or removed.stdout.strip() or "no diagnostic"
+                    raise RuntimeError(f"Could not remove the temporary Podman container: {detail}")
+            finally:
+                self.started = False
+
+    def dataset_path(self, source: Path) -> str:
+        source = source.resolve()
+        target = self.source_targets.get(source.parent)
+        if target is None:
+            raise ValueError("Podman PDFium session can only read PDFs from its mounted source folders.")
+        return f"{target}/{source.name}"
+
+    def work_path(self, path: Path) -> str:
+        path = path.resolve()
+        try:
+            relative = path.relative_to(self.work_directory)
+        except ValueError as error:
+            raise ValueError("Podman PDFium output must stay inside its temporary work folder.") from error
+        return "/quickchart/work/" + relative.as_posix()
+
+    def _exec(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        if not self.started or not self.podman:
+            raise RuntimeError("Podman PDFium session is not running.")
+        completed = subprocess.run([self.podman, "exec", self.name, *arguments],
+                                   text=True, capture_output=True, timeout=3600)
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
+            raise RuntimeError(f"Podman GDAL command failed ({arguments[0]}): {detail}")
+        return completed
+
+    def read_info(self, source: Path) -> dict:
+        completed = self._exec("gdalinfo", "-json", self.dataset_path(source))
+        return json.loads(completed.stdout)
+
+    def render_page(self, dataset: str, destination: Path, dpi: int) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self._exec("gdal_translate", "-oo", f"DPI={dpi}", "-of", "GTiff",
+                   "-co", "TILED=YES", "-co", "COMPRESS=DEFLATE",
+                   dataset, self.work_path(destination))
 
 
 @dataclass(frozen=True)
@@ -652,7 +805,10 @@ def write_projected_grid_gpx(path: Path, source_wkt: str, source_transform: GeoT
     """Write GPX waypoints at known projected-map grid intersections."""
     points = projected_grid_pixels(source_transform, width, height, spacing_metres)
     if not points:
-        raise ValueError("no projected grid intersections fall within the source raster")
+        # This is an optional calibration aid. Some map frames do not contain
+        # a crossing at the requested interval; that must not invalidate the
+        # map conversion, and an empty GPX would be misleading.
+        return 0
     namespace = "http://www.topografix.com/GPX/1/1"
     ET.register_namespace("", namespace)
     root = ET.Element(f"{{{namespace}}}gpx", {"version": "1.1", "creator": "GeoTIFF QuickChart Converter"})
@@ -691,14 +847,62 @@ def write_projected_grid_validation(source: Path, path: Path, spacing_metres: in
     return write_projected_grid_gpx(path, source_wkt, transform, width, height, spacing_metres)
 
 
-def pdf_page_datasets(source: Path) -> list[str]:
+def write_projected_grid_validation_from_geopdf(
+        source: Path, path: Path, spacing_metres: int, *, dpi: int = 300, page: int = 1,
+        pdfium_container_image: str | None = None,
+        pdfium_session: PodmanPdfiumSession | None = None) -> int:
+    """Render a GeoPDF page temporarily and create projected-grid checkpoints without a QCT."""
+    source = source.resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    if source.suffix.lower() != ".pdf":
+        raise ValueError("GeoPDF checkpoint generation expects a .pdf input")
+    if dpi < 72 or dpi > 1200:
+        raise ValueError("GeoPDF DPI must be between 72 and 1200")
+    if spacing_metres <= 0:
+        raise ValueError("Projected-grid spacing must be a positive number of metres")
+    if pdfium_session is not None and pdfium_container_image is not None:
+        raise ValueError("Pass either a shared PDFium session or an image name, not both.")
+
+    if pdfium_session is not None:
+        pages = pdf_page_datasets(source, reader=pdfium_session.read_info,
+                                  dataset_name=pdfium_session.dataset_path)
+        if not 1 <= page <= len(pages):
+            raise ValueError(f"GeoPDF page must be between 1 and {len(pages)}")
+        staged = pdfium_session.work_directory / f"grid-check-{uuid.uuid4().hex}.tif"
+        pdfium_session.render_page(pages[page - 1], staged, dpi)
+        try:
+            return write_projected_grid_validation(staged, path, spacing_metres)
+        finally:
+            staged.unlink(missing_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="geopdf-grid-check-") as folder:
+        work = Path(folder)
+        staged = work / "rendered-page.tif"
+        if pdfium_container_image:
+            with PodmanPdfiumSession(pdfium_container_image, source, work) as renderer:
+                pages = pdf_page_datasets(source, reader=renderer.read_info,
+                                          dataset_name=renderer.dataset_path)
+                if not 1 <= page <= len(pages):
+                    raise ValueError(f"GeoPDF page must be between 1 and {len(pages)}")
+                renderer.render_page(pages[page - 1], staged, dpi)
+        else:
+            pages = pdf_page_datasets(source)
+            if not 1 <= page <= len(pages):
+                raise ValueError(f"GeoPDF page must be between 1 and {len(pages)}")
+            run([require_program("gdal_translate"), "-oo", f"DPI={dpi}", "-of", "GTiff",
+                 "-co", "TILED=YES", "-co", "COMPRESS=DEFLATE", pages[page - 1], str(staged)])
+        return write_projected_grid_validation(staged, path, spacing_metres)
+
+
+def pdf_page_datasets(source: Path, *, reader=None, dataset_name=None) -> list[str]:
     """Return GDAL dataset names for PDF pages, preserving GDAL's own naming."""
-    info = read_info(source)
+    info = reader(source) if reader is not None else read_info(source)
     subdatasets = (info.get("metadata") or {}).get("SUBDATASETS") or {}
     names = [(key, value) for key, value in subdatasets.items()
              if key.endswith("_NAME") and isinstance(value, str)]
     if not names:
-        return [str(source)]
+        return [dataset_name(source) if dataset_name is not None else str(source)]
     def page_key(item: tuple[str, str]) -> int:
         match = re.search(r"SUBDATASET_(\d+)_NAME", item[0])
         return int(match.group(1)) if match else 0
@@ -710,7 +914,9 @@ def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int
                    validation_gpx: Path | None = None, validation_grid: int = 3,
                    projected_grid_gpx: Path | None = None,
                    projected_grid_spacing: int = 50000,
-                   save_geotiff: Path | None = None) -> dict:
+                   save_geotiff: Path | None = None,
+                   pdfium_container_image: str | None = None,
+                   pdfium_session: PodmanPdfiumSession | None = None) -> dict:
     """Render one georeferenced PDF page to a temporary GeoTIFF, then create a QCT."""
     source = source.resolve()
     if not source.is_file():
@@ -719,9 +925,6 @@ def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int
         raise ValueError("GeoPDF conversion expects a .pdf input")
     if dpi < 72 or dpi > 1200:
         raise ValueError("GeoPDF DPI must be between 72 and 1200")
-    pages = pdf_page_datasets(source)
-    if not 1 <= page <= len(pages):
-        raise ValueError(f"GeoPDF page must be between 1 and {len(pages)}")
     if projected_grid_gpx is not None and projected_grid_gpx.exists() and not overwrite:
         raise FileExistsError(f"Refusing to overwrite existing GPX: {projected_grid_gpx}")
     if save_geotiff is not None:
@@ -731,13 +934,37 @@ def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int
         if save_geotiff.exists() and not overwrite:
             raise FileExistsError(f"Refusing to overwrite existing GeoTIFF: {save_geotiff}")
     pdf_hash = sha256(source)
-    work_context = tempfile.TemporaryDirectory(prefix="geopdf-qct-")
-    work = Path(work_context.name)
+    if pdfium_session is not None and pdfium_container_image is not None:
+        raise ValueError("Pass either a shared PDFium session or an image name, not both.")
+    work_context = None if pdfium_session is not None else tempfile.TemporaryDirectory(prefix="geopdf-qct-")
+    work = pdfium_session.work_directory if pdfium_session is not None else Path(work_context.name)
+    staged = work / (f"rendered-page-{uuid.uuid4().hex}.tif" if pdfium_session is not None
+                     else "rendered-page.tif")
     try:
-        staged = work / "rendered-page.tif"
-        # Rasterise at an explicit DPI and retain GDAL's georeferencing in the staged TIFF.
-        run([require_program("gdal_translate"), "-oo", f"DPI={dpi}", "-of", "GTiff",
-             "-co", "TILED=YES", "-co", "COMPRESS=DEFLATE", pages[page - 1], str(staged)])
+        if pdfium_session is not None:
+            # The GUI can keep one read-only-source container alive for its full batch.
+            pages = pdf_page_datasets(source, reader=pdfium_session.read_info,
+                                      dataset_name=pdfium_session.dataset_path)
+            if not 1 <= page <= len(pages):
+                raise ValueError(f"GeoPDF page must be between 1 and {len(pages)}")
+            pdfium_session.render_page(pages[page - 1], staged, dpi)
+            pdfium_image_id = pdfium_session.image_id
+        elif pdfium_container_image:
+            # Standalone callers retain the convenient one-map container lifecycle.
+            with PodmanPdfiumSession(pdfium_container_image, source, work) as renderer:
+                pages = pdf_page_datasets(source, reader=renderer.read_info,
+                                          dataset_name=renderer.dataset_path)
+                if not 1 <= page <= len(pages):
+                    raise ValueError(f"GeoPDF page must be between 1 and {len(pages)}")
+                renderer.render_page(pages[page - 1], staged, dpi)
+                pdfium_image_id = renderer.image_id
+        else:
+            pages = pdf_page_datasets(source)
+            if not 1 <= page <= len(pages):
+                raise ValueError(f"GeoPDF page must be between 1 and {len(pages)}")
+            # Rasterise at an explicit DPI and retain GDAL's georeferencing in the staged TIFF.
+            run([require_program("gdal_translate"), "-oo", f"DPI={dpi}", "-of", "GTiff",
+                 "-co", "TILED=YES", "-co", "COMPRESS=DEFLATE", pages[page - 1], str(staged)])
         report = convert_geotiff(staged, destination, overwrite=overwrite, keep_work=keep_work,
                                  validation_gpx=validation_gpx, validation_grid=validation_grid,
                                  title=source.name)
@@ -780,21 +1007,36 @@ def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int
             "page": page,
             "page_count": len(pages),
             "dpi": dpi,
+            "renderer": ("Podman PDFium" if pdfium_session is not None or pdfium_container_image
+                         else "Windows GDAL"),
+            "renderer_image": (pdfium_session.image if pdfium_session is not None
+                               else pdfium_container_image),
+            "renderer_image_id": (pdfium_session.image_id if pdfium_session is not None
+                                  else pdfium_image_id if pdfium_container_image else None),
             "staged_geotiff_sha256": staged_hash,
             "staged_geotiff_pixel_dimensions": report["source_pixel_dimensions"],
             "saved_geotiff": str(save_geotiff) if save_geotiff is not None else None,
         }
-        report["projected_grid_gpx"] = str(projected_grid_gpx) if projected_grid_gpx else None
+        report["projected_grid_gpx"] = (str(projected_grid_gpx)
+                                         if projected_grid_gpx is not None and projected_count else None)
         report["projected_grid_checkpoints"] = projected_count
+        if projected_grid_gpx is not None and projected_count == 0:
+            report["projected_grid_warning"] = (
+                f"No projected-grid intersections were found at {projected_grid_spacing} m spacing; "
+                "the map was converted without a projected-grid GPX."
+            )
         destination.with_suffix(destination.suffix + ".validation.json").write_text(
             json.dumps(report, indent=2) + "\n", encoding="utf-8")
         return report
     finally:
-        if keep_work:
-            print(f"Retained GeoPDF staging directory: {work}")
-            work_context.cleanup = lambda: None  # type: ignore[method-assign]
-        else:
-            work_context.cleanup()
+        if work_context is not None:
+            if keep_work:
+                print(f"Retained GeoPDF staging directory: {work}")
+                work_context.cleanup = lambda: None  # type: ignore[method-assign]
+            else:
+                work_context.cleanup()
+        elif not keep_work:
+            staged.unlink(missing_ok=True)
 
 
 def convert_geotiff(source: Path, destination: Path, *, overwrite: bool = False,
@@ -943,6 +1185,15 @@ class QuickChartTests(unittest.TestCase):
         self.assertIn((1500, 4500, 50.0, 50.0), points)
         self.assertTrue(all(0 <= x < 100 and 0 <= y < 80 for _, _, x, y in points))
 
+    def test_projected_grid_with_no_intersections_is_nonfatal_and_writes_no_empty_gpx(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            gpx = Path(folder) / "grid.gpx"
+            count = write_projected_grid_gpx(
+                gpx, "unused until a crossing exists", GeoTransform((101, 1, 0, 101, 0, -1)),
+                20, 20, 5000)
+            self.assertEqual(count, 0)
+            self.assertFalse(gpx.exists())
+
     def test_gdal_geotiff_end_to_end_when_available(self) -> None:
         if not all(shutil.which(tool) for tool in ("gdal_translate", "gdaltransform", "gdalinfo")):
             self.skipTest("GDAL command-line programs are unavailable")
@@ -1001,6 +1252,26 @@ class QuickChartTests(unittest.TestCase):
             self.assertEqual(sha256(saved_tif), replacement["geopdf"]["staged_geotiff_sha256"])
             self.assertEqual(before, sha256(pdf))
 
+            no_grid_qct = folder_path / "no-grid.qct"
+            no_grid_gpx = folder_path / "no-grid.gpx"
+            no_grid_tif = folder_path / "no-grid.tif"
+            no_grid_report = convert_geopdf(
+                pdf, no_grid_qct, dpi=72, projected_grid_gpx=no_grid_gpx,
+                projected_grid_spacing=60000, save_geotiff=no_grid_tif)
+            self.assertTrue(no_grid_qct.is_file())
+            self.assertTrue(no_grid_tif.is_file())
+            self.assertFalse(no_grid_gpx.exists())
+            self.assertEqual(no_grid_report["projected_grid_checkpoints"], 0)
+            self.assertIsNone(no_grid_report["projected_grid_gpx"])
+            self.assertIn("No projected-grid intersections", no_grid_report["projected_grid_warning"])
+
+            checkpoints_only = folder_path / "checkpoints-only.gpx"
+            checkpoint_count = write_projected_grid_validation_from_geopdf(
+                pdf, checkpoints_only, 10000, dpi=72, page=1)
+            self.assertGreater(checkpoint_count, 0)
+            self.assertTrue(checkpoints_only.is_file())
+            self.assertFalse((folder_path / "checkpoints-only.qct").exists())
+
 
 def main(arguments: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1046,7 +1317,10 @@ def main(arguments: Iterable[str] | None = None) -> int:
         target.parent.mkdir(parents=True, exist_ok=True)
         count = write_projected_grid_gpx(target, source_wkt, transform, width, height,
                                          args.projected_grid_metres)
-        print(json.dumps({"validation_gpx": str(target), "checkpoints": count,
+        print(json.dumps({"validation_gpx": str(target) if count else None, "checkpoints": count,
+                          "warning": (f"No projected-grid intersections were found at "
+                                      f"{args.projected_grid_metres} m spacing; no GPX was written."
+                                      if count == 0 else None),
                           "calibration_fit_max_abs_error_degrees": forward_error,
                           "inverse_calibration_fit_max_abs_error_pixels": inverse_error}, indent=2))
         return 0
@@ -1070,9 +1344,15 @@ def main(arguments: Iterable[str] | None = None) -> int:
                                  validation_grid=args.validation_grid)
         if projected_path is not None:
             projected_path.parent.mkdir(parents=True, exist_ok=True)
-            report["projected_grid_gpx"] = str(projected_path)
-            report["projected_grid_checkpoints"] = write_projected_grid_validation(
+            projected_count = write_projected_grid_validation(
                 args.source, projected_path, args.projected_grid_metres)
+            report["projected_grid_gpx"] = str(projected_path) if projected_count else None
+            report["projected_grid_checkpoints"] = projected_count
+            if projected_count == 0:
+                report["projected_grid_warning"] = (
+                    f"No projected-grid intersections were found at {args.projected_grid_metres} m "
+                    "spacing; the map was converted without a projected-grid GPX."
+                )
             args.destination.with_suffix(args.destination.suffix + ".validation.json").write_text(
                 json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))
