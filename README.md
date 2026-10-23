@@ -1,11 +1,13 @@
-# GeoTIFF QuickChart Converter
+# GeoTIFF/GeoPDF to Memory-Map QuickChart and OziExplorer OZF2 Converter
 
 > **AI-generated code notice:** This repository contains AI-generated code.
 > Review, test, and validate it before using it with maps or other data.
 
-This is an experimental, standalone GeoTIFF/GeoPDF-to-Quick Chart converter for
-a GDAL toolchain. It preserves the input file and writes a newly generated,
-unencrypted, legacy Quick Chart v2 (`.qct`) map.
+This is an experimental Windows application that converts GeoTIFF and GeoPDF
+maps into Memory-Map QuickChart files. It always creates a newly generated,
+unencrypted, legacy Quick Chart v2 (`.qct`) map and can optionally create an
+OziExplorer OZF2 (`.ozf2`) map with its matching calibrated `.map` file. It
+preserves the input file.
 
 It is not a replacement for Memory-Map Navigator and does not implement QC3,
 licensing, DRM, encrypted maps, or existing-map conversion. It uses GDAL to
@@ -21,9 +23,13 @@ or plug-in folders.
 - For GeoPDF input, a GDAL PDF read backend such as Poppler or PDFium.
 - Python 3.10+ with Pillow.
 - Optional OziExplorer OZF2 output: a separately installed MAPC2MAPC program
-  with its documented `-az` batch export. QuickChart does not download,
-  install, or bundle MAPC2MAPC; select its executable in the GUI when enabling
-  the OZF2 option. The 64-bit executable is recommended for 64-bit Windows.
+  with its documented `-az` batch export. Download MAPC2MAPC from its
+  [official download page](https://www.the-thorns.org.uk/mapping/down.html).
+  QuickChart does not download, install, or bundle MAPC2MAPC; select its
+  executable in the GUI when enabling the OZF2 option. The 64-bit executable
+  is recommended for 64-bit Windows. The unregistered version is a trial and
+  places red X marks on generated maps; see the official site for registration
+  details.
 - Optional for the GUI's container renderer: Docker Desktop or Podman Desktop
   with its engine running and the selected PDFium image already pulled locally.
 
@@ -92,7 +98,7 @@ is retained as a regression case; an earlier reprojection-based approach gave
 it a trapezoidal footprint with surrounding no-data. The current converter
 retains the native raster grid instead.
 
-## Windows GUI
+## Windows GUI: Memory-Map QuickChart and OziExplorer OZF2
 
 For repeat or multi-map conversions on Windows, start the included graphical
 front end from the repository folder:
