@@ -313,7 +313,7 @@ northing grid crossing. This option is for projected source coordinate systems
 whose units are metres, such as MGA and UTM.
 
 
-**Always esure you check the calibration of converted maps before using them.**
+**Always check the calibration of converted maps before using them. Calibration errors can occur when transforming between georeferenced formats**
 
 
 ## Rebuild from scratch
