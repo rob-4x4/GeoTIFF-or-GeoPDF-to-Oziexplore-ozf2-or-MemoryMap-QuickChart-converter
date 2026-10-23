@@ -7,10 +7,25 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from geotiff_qct_gui import ConverterWindow
+from geotiff_qct_gui import ConverterWindow, find_mapc2mapc
 
 
 class GuiOutputTests(unittest.TestCase):
+    def test_mapc2mapc_search_checks_common_c_and_d_install_folders(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            c_drive, d_drive = root / "C", root / "D"
+            executable = d_drive / "Program Files" / "MAPC2MAPC" / "mapc2mapc64.exe"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"stub")
+
+            self.assertEqual(find_mapc2mapc((c_drive, d_drive)), executable.resolve())
+
+    def test_mapc2mapc_search_returns_none_when_common_locations_are_empty(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            self.assertIsNone(find_mapc2mapc((root / "C", root / "D")))
+
     def test_selected_source_is_never_overwritten_even_if_replacement_enabled(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

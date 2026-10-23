@@ -77,6 +77,48 @@ def probe_gdal(bin_directory: Path | None = None) -> GdalStatus:
                       f"GDAL ready - {version}. GeoTIFF: available. GeoPDF driver: {pdf_status}.")
 
 
+def find_mapc2mapc(roots: tuple[Path, ...] | None = None) -> Path | None:
+    """Find MAPC2MAPC in common C:/D: install folders without scanning whole drives."""
+    if roots is None:
+        roots = tuple(Path(f"{drive}:\\") for drive in ("C", "D"))
+    executable_names = ("mapc2mapc64.exe", "mapc2mapc.exe")
+    search_directories: list[Path] = []
+    for root in roots:
+        search_directories.extend((
+            root,
+            root / "MAPC2MAPC",
+            root / "MAPC2MAPC 64",
+            root / "Program Files" / "MAPC2MAPC",
+            root / "Program Files" / "MAPC2MAPC 64",
+            root / "Program Files (x86)" / "MAPC2MAPC",
+            root / "Program Files (x86)" / "MAPC2MAPC 64",
+            root / "OziExplorer" / "MAPC2MAPC",
+        ))
+        # Some installers use a vendor/versioned directory below Program Files.
+        for parent in (root / "Program Files", root / "Program Files (x86)"):
+            try:
+                search_directories.extend(
+                    child for child in parent.iterdir()
+                    if child.is_dir() and "mapc2mapc" in child.name.casefold())
+            except OSError:
+                pass
+
+    seen: set[Path] = set()
+    for directory in search_directories:
+        try:
+            resolved = directory.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            for name in executable_names:
+                candidate = directory / name
+                if candidate.is_file():
+                    return candidate.resolve()
+        except OSError:
+            continue
+    return None
+
+
 class ConverterWindow:
     """A safe, small batch-conversion UI around the tested CLI implementation."""
 
@@ -196,6 +238,9 @@ class ConverterWindow:
         self.mapc2mapc_button = ttk.Button(destination, text="Choose MAPC2MAPC…",
                                            command=self._choose_mapc2mapc)
         self.mapc2mapc_button.grid(row=7, column=1, padx=(7, 0), pady=(3, 0))
+        self.find_mapc2mapc_button = ttk.Button(destination, text="Find on C: / D:",
+                                                command=self._find_mapc2mapc)
+        self.find_mapc2mapc_button.grid(row=7, column=2, padx=(7, 0), pady=(3, 0))
 
         validation = ttk.LabelFrame(outer, text="Validation outputs", padding=8)
         validation.grid(row=4, column=0, sticky="ew", pady=(0, 10))
@@ -281,6 +326,17 @@ class ConverterWindow:
             filetypes=[("Windows programs", "*.exe"), ("All files", "*.*")])
         if selected:
             self.mapc2mapc_executable.set(selected)
+
+    def _find_mapc2mapc(self) -> None:
+        found = find_mapc2mapc()
+        if found is None:
+            messagebox.showinfo(
+                APPLICATION_TITLE,
+                "MAPC2MAPC was not found in the common install folders on C: or D:. "
+                "Use Choose MAPC2MAPC… to locate mapc2mapc64.exe manually.")
+            return
+        self.mapc2mapc_executable.set(str(found))
+        messagebox.showinfo(APPLICATION_TITLE, f"Found MAPC2MAPC:\n{found}")
 
     def _choose_gdal_folder(self) -> None:
         selected = filedialog.askdirectory(title="Choose the folder containing GDAL programs")
@@ -855,7 +911,7 @@ class ConverterWindow:
                        self.grid_only_button, self.tiff_only_button,
                        self.pdfium_image_entry, self.pdfium_check_button, self.ozi_output_check,
                        self.ozi_output_entry, self.ozi_output_button,
-                       self.mapc2mapc_entry, self.mapc2mapc_button):
+                       self.mapc2mapc_entry, self.mapc2mapc_button, self.find_mapc2mapc_button):
             widget.configure(state=state)
         self.stop_button.configure(state="normal" if busy and not self.stop_event.is_set() else "disabled")
         self.pdf_renderer_choice.configure(state="disabled" if busy else "readonly")

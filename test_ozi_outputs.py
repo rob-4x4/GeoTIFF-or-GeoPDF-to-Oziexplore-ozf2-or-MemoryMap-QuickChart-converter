@@ -47,6 +47,10 @@ class OziOutputTests(unittest.TestCase):
 
             def fake_run(command, **kwargs):
                 work = Path(kwargs["cwd"])
+                image = work / source.name
+                input_map = Path(command[1])
+                self.assertTrue(image.is_file())
+                self.assertEqual(input_map.read_text(encoding="utf-8").splitlines()[2], source.name)
                 generated = work / "output"
                 generated.mkdir()
                 (generated / "source.ozf2").write_bytes(b"ozf2 fixture")

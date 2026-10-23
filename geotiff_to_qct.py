@@ -351,7 +351,8 @@ def _ozi_degrees_minutes(value: float, *, latitude: bool) -> tuple[int, float, s
     return degrees, minutes, hemisphere
 
 
-def write_ozi_map(source: Path, map_path: Path, info: dict, title: str) -> None:
+def write_ozi_map(source: Path, map_path: Path, info: dict, title: str,
+                  image_reference: str | None = None) -> None:
     """Write an OziExplorer MAP 2.1 calibration linked to a georeferenced raster."""
     size = info.get("size")
     geo_transform = info.get("geoTransform")
@@ -368,7 +369,7 @@ def write_ozi_map(source: Path, map_path: Path, info: dict, title: str) -> None:
     lines = [
         "OziExplorer Map Data File Version 2.1",
         title,
-        str(source.resolve()),
+        image_reference or str(source.resolve()),
         "1 ,Map Code,",
         "WGS 84,, 0.0000, 0.0000,WGS 84",
         "Reserved 1",
@@ -425,10 +426,17 @@ def convert_ozi_ozf2(source: Path, output_directory: Path, mapc2mapc_executable:
         raise FileExistsError("Refusing to overwrite existing OziExplorer output: " +
                               ", ".join(str(path) for path in existing))
     output_directory.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="quickchart-ozi-") as temporary:
+    # MAPC2MAPC may ask the user to locate the raster when a MAP file points
+    # across temporary directories. Keep the MAP and a temporary raster copy
+    # together and reference it by its local filename. Copying (rather than
+    # hard-linking) guarantees MAPC2MAPC cannot alter the selected source.
+    with tempfile.TemporaryDirectory(prefix="quickchart-ozi-", dir=output_directory) as temporary:
         work = Path(temporary)
+        image_for_map = work / source.name
+        shutil.copy2(source, image_for_map)
         input_map = work / f"{stem}.map"
-        write_ozi_map(source, input_map, read_info(source), stem)
+        write_ozi_map(image_for_map, input_map, read_info(source), stem,
+                      image_reference=image_for_map.name)
         completed = subprocess.run([str(executable), str(input_map), "-az"], cwd=work,
                                    text=True, capture_output=True)
         if completed.returncode:

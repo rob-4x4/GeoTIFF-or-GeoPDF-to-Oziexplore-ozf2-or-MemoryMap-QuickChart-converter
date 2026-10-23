@@ -134,9 +134,15 @@ installation in its documented command-line batch mode (`-az`); QuickChart
 does not install or bundle MAPC2MAPC. The app writes a temporary Ozi MAP 2.1
 calibration linked to the georeferenced raster, asks MAPC2MAPC to create the
 OZF2 pair, then publishes the completed `.ozf2` and matching `.map` together.
+For this handoff, the app makes a temporary raster copy beside the temporary
+MAP file and references it by filename; this avoids MAPC2MAPC's image-location
+prompt and ensures the selected source is never exposed to modification.
 MAPC2MAPC must be installed separately and its executable selected in the
 **MAPC2MAPC executable** field; conversion is unavailable if that file is not
-selected or cannot be run.
+selected or cannot be run. Use **Find on C: / D:** to check common install
+folders on those drives (including Program Files); it does not scan entire
+drives. If the executable is stored elsewhere, use **Choose MAPC2MAPC…** to
+select it manually. The 64-bit executable is preferred when both are present.
 For GeoPDF inputs the selected page is rendered with the chosen renderer and DPI
 first. Existing OZF2/MAP outputs are protected unless replacement is enabled.
 OZF2 is supported by OziExplorer for Windows and Android; Img2Ozf is not needed
