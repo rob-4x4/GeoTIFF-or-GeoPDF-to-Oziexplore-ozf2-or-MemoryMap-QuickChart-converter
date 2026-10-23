@@ -4,10 +4,10 @@
 > Review, test, and validate it before using it with maps or other data.
 
 This is an experimental Windows application that converts GeoTIFF and GeoPDF
-maps into Memory-Map QuickChart files. It always creates a newly generated,
-unencrypted, legacy Quick Chart v2 (`.qct`) map and can optionally create an
-OziExplorer OZF2 (`.ozf2`) map with its matching calibrated `.map` file. It
-preserves the input file.
+maps into Oziexplorer OZF2 or Memory-Map QuickChart files. It always creates 
+a newly generated, unencrypted, legacy Quick Chart v2 (`.qct`) map and can 
+optionally create an OziExplorer OZF2 (`.ozf2`) map with its matching 
+calibrated `.map` file. It preserves the input file.
 
 It is not a replacement for Memory-Map Navigator and does not implement QC3,
 licensing, DRM, encrypted maps, or existing-map conversion. It uses GDAL to
@@ -33,7 +33,7 @@ or plug-in folders.
 - Optional for the GUI's container renderer: Docker Desktop or Podman Desktop
   with its engine running and the selected PDFium image already pulled locally.
 
-Install the Python dependency on another machine with:
+Install the Python dependency  with:
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -169,7 +169,9 @@ configuration files.
 ### Docker or Podman PDFium rendering (optional GUI mode)
 
 The GUI can use a Linux GDAL/PDFium image in Docker or Podman for GeoPDF page
-discovery and rasterisation. Choose **Container PDFium** under **GeoPDF renderer** and leave
+discovery and rasterisation. 
+PDFium seems to better preserve the colours of the original GEOPDF file.
+Choose **Container PDFium** under **GeoPDF renderer** and leave
 the default image as `docker.io/maptiler/gdal:3.11-pdfium-py3.13` for the image
 used in the verified colour comparison. Click **Check image** before
 conversion. Docker or Podman must be on `PATH`, its engine must be running, and
@@ -309,6 +311,10 @@ Load this GPX with the existing QCT, then select several waypoints. Each
 `QCT-grid-E...-N...` waypoint must sit exactly on its matching printed easting /
 northing grid crossing. This option is for projected source coordinate systems
 whose units are metres, such as MGA and UTM.
+
+
+**Always esure you check the calibration of converted maps before using them.**
+
 
 ## Rebuild from scratch
 
