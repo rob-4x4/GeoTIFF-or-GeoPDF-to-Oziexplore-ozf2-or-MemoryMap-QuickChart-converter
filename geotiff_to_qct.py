@@ -339,6 +339,152 @@ def transform_points(source_srs: str, target_srs: str,
     return transformed
 
 
+def _ozi_degrees_minutes(value: float, *, latitude: bool) -> tuple[int, float, str]:
+    hemisphere = (("N" if value >= 0 else "S") if latitude
+                  else ("E" if value >= 0 else "W"))
+    absolute = abs(value)
+    degrees = int(absolute)
+    minutes = (absolute - degrees) * 60
+    if round(minutes, 8) >= 60:
+        degrees += 1
+        minutes = 0.0
+    return degrees, minutes, hemisphere
+
+
+def write_ozi_map(source: Path, map_path: Path, info: dict, title: str) -> None:
+    """Write an OziExplorer MAP 2.1 calibration linked to a georeferenced raster."""
+    size = info.get("size")
+    geo_transform = info.get("geoTransform")
+    wkt = (info.get("coordinateSystem") or {}).get("wkt")
+    if (not isinstance(size, list) or len(size) != 2 or not isinstance(geo_transform, list)
+            or len(geo_transform) != 6 or not isinstance(wkt, str)):
+        raise ValueError("OziExplorer output requires a raster with an affine transform and CRS")
+    width, height = int(size[0]), int(size[1])
+    a, b, c, d, e, f = (float(value) for value in geo_transform)
+    pixels = [(round((width - 1) * column / 4), round((height - 1) * row / 4))
+              for row in range(5) for column in range(5)]
+    projected = [(a + b * x + c * y, d + e * x + f * y) for x, y in pixels]
+    lon_lat = transform_points(wkt, "EPSG:4326", projected)
+    lines = [
+        "OziExplorer Map Data File Version 2.1",
+        title,
+        str(source.resolve()),
+        "1 ,Map Code,",
+        "WGS 84,, 0.0000, 0.0000,WGS 84",
+        "Reserved 1",
+        "Reserved 2",
+        "Magnetic Variation,,,E",
+        "Map Projection,Latitude/Longitude,PolyCal,No,AutoCalOnly,No,BSBUseWPX,No",
+    ]
+    for index, ((x, y), (longitude, latitude)) in enumerate(zip(pixels, lon_lat, strict=True), 1):
+        lat_degrees, lat_minutes, lat_hemi = _ozi_degrees_minutes(latitude, latitude=True)
+        lon_degrees, lon_minutes, lon_hemi = _ozi_degrees_minutes(longitude, latitude=False)
+        lines.append(
+            f"Point{index:02d},xy,{x},{y},in,deg,{lat_degrees},{lat_minutes:.8f},{lat_hemi},"
+            f"{lon_degrees},{lon_minutes:.8f},{lon_hemi},grid,,,,S"
+        )
+    for index in range(len(pixels) + 1, 31):
+        lines.append(f"Point{index:02d},xy, , ,in, deg, , ,N, , ,E, grid, , , ,N")
+    lines.extend([
+        "Projection Setup, 0.000000000, 0.000000000, 1.000000000, 0.00, 0.00, "
+        "0.000000000, 0.000000000,,,,",
+        "Map Feature = MF ; Map Comment = MC",
+        "MM0,Yes",
+        "MMPNUM,4",
+    ])
+    corner_indexes = (0, 4, 20, 24)
+    for index, corner_index in enumerate(corner_indexes, 1):
+        x, y = pixels[corner_index]
+        lines.append(f"MMPXY,{index},{x},{y}")
+    for index, corner_index in enumerate(corner_indexes, 1):
+        longitude, latitude = lon_lat[corner_index]
+        lines.append(f"MMPLL,{index},{longitude:.10f},{latitude:.10f}")
+    lines.extend([
+        "MOP,Map Open Position,0,0",
+        f"IWH,Map Image Width/Height,{width},{height}",
+        "",
+    ])
+    map_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def convert_ozi_ozf2(source: Path, output_directory: Path, mapc2mapc_executable: Path,
+                     *, output_stem: str | None = None, overwrite: bool = False) -> dict:
+    """Use the user's MAPC2MAPC installation to make an OZF2 + calibrated MAP pair."""
+    source = source.resolve()
+    output_directory = output_directory.resolve()
+    executable = mapc2mapc_executable.resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    if not executable.is_file():
+        raise FileNotFoundError(f"MAPC2MAPC executable not found: {executable}")
+    stem = output_stem or source.stem
+    map_target = output_directory / f"{stem}.map"
+    ozf_target = output_directory / f"{stem}.ozf2"
+    existing = [path for path in (map_target, ozf_target) if path.exists()]
+    if existing and not overwrite:
+        raise FileExistsError("Refusing to overwrite existing OziExplorer output: " +
+                              ", ".join(str(path) for path in existing))
+    output_directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="quickchart-ozi-") as temporary:
+        work = Path(temporary)
+        input_map = work / f"{stem}.map"
+        write_ozi_map(source, input_map, read_info(source), stem)
+        completed = subprocess.run([str(executable), str(input_map), "-az"], cwd=work,
+                                   text=True, capture_output=True)
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
+            raise RuntimeError(f"MAPC2MAPC OZF2 conversion failed: {detail}")
+        candidates = [path for path in work.rglob("*.ozf2") if path.is_file()]
+        map_candidates = [path for path in work.rglob("*.map") if path.is_file() and path != input_map]
+        if len(candidates) != 1 or len(map_candidates) != 1:
+            raise RuntimeError("MAPC2MAPC did not produce exactly one OZF2 image and matching MAP file")
+        generated_ozf, generated_map = candidates[0], map_candidates[0]
+        map_text = generated_map.read_text(encoding="utf-8-sig", errors="replace")
+        map_lines = map_text.splitlines()
+        if len(map_lines) < 3:
+            raise RuntimeError("MAPC2MAPC generated an invalid MAP file")
+        # The output pair is co-located in the selected folder, so keep the link portable.
+        map_lines[2] = ozf_target.name
+        staged_map = work / f"{stem}.result.map"
+        staged_map.write_text("\n".join(map_lines) + "\n", encoding="utf-8")
+        staged_ozf = work / f"{stem}.result.ozf2"
+        shutil.copyfile(generated_ozf, staged_ozf)
+        # Publish only complete files. If the second write fails, remove the first
+        # newly-created file; overwrite mode retains recoverable temporary copies.
+        backups: list[tuple[Path, Path]] = []
+        if overwrite:
+            for target in (map_target, ozf_target):
+                if target.exists():
+                    backup = work / (target.name + ".backup")
+                    shutil.copy2(target, backup)
+                    backups.append((target, backup))
+        published: list[Path] = []
+        try:
+            if overwrite:
+                staged_map.replace(map_target)
+                published.append(map_target)
+                staged_ozf.replace(ozf_target)
+                published.append(ozf_target)
+            else:
+                with map_target.open("xb") as outgoing:
+                    published.append(map_target)
+                    with staged_map.open("rb") as incoming:
+                        shutil.copyfileobj(incoming, outgoing)
+                with ozf_target.open("xb") as outgoing:
+                    published.append(ozf_target)
+                    with staged_ozf.open("rb") as incoming:
+                        shutil.copyfileobj(incoming, outgoing)
+        except BaseException:
+            for target in published:
+                target.unlink(missing_ok=True)
+            for target, backup in backups:
+                if backup.exists():
+                    shutil.copy2(backup, target)
+            raise
+    return {"map": str(map_target), "ozf2": str(ozf_target),
+            "mapc2mapc": str(executable), "image_dimensions": read_info(source).get("size")}
+
+
 def solve_linear_system(matrix: list[list[float]], values: list[float]) -> list[float]:
     """Solve a small well-conditioned square system by pivoted elimination."""
     size = len(values)
@@ -957,12 +1103,111 @@ def pdf_page_datasets(source: Path, *, reader=None, dataset_name=None) -> list[s
     return [value for _, value in sorted(names, key=page_key)]
 
 
+def render_geopdf_to_geotiff(source: Path, destination: Path, *, dpi: int = 300, page: int = 1,
+                             overwrite: bool = False,
+                             pdfium_container_image: str | None = None,
+                             pdfium_session: ContainerPdfiumSession | None = None) -> dict:
+    """Render a GeoPDF page directly to a saved GeoTIFF, without making QCT or GPX files."""
+    source = source.resolve()
+    destination = destination.resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    if source.suffix.lower() != ".pdf":
+        raise ValueError("GeoTIFF backfill expects a .pdf input")
+    if dpi < 72 or dpi > 1200:
+        raise ValueError("GeoPDF DPI must be between 72 and 1200")
+    if destination == source:
+        raise ValueError("GeoTIFF output must differ from the source PDF")
+    if destination.exists() and not overwrite:
+        raise FileExistsError(f"Refusing to overwrite existing GeoTIFF: {destination}")
+    if pdfium_session is not None and pdfium_container_image is not None:
+        raise ValueError("Pass either a shared PDFium session or an image name, not both.")
+
+    pdf_hash = sha256(source)
+    work_context = (None if pdfium_session is not None
+                    else tempfile.TemporaryDirectory(prefix="geopdf-tiff-backfill-"))
+    work = pdfium_session.work_directory if pdfium_session is not None else Path(work_context.name)
+    staged = work / (f"backfill-{uuid.uuid4().hex}.tif" if pdfium_session is not None
+                     else "rendered-page.tif")
+    pdfium_image_id = None
+    try:
+        if pdfium_session is not None:
+            pages = pdf_page_datasets(source, reader=pdfium_session.read_info,
+                                      dataset_name=pdfium_session.dataset_path)
+            if not 1 <= page <= len(pages):
+                raise ValueError(f"GeoPDF page must be between 1 and {len(pages)}")
+            pdfium_session.render_page(pages[page - 1], staged, dpi)
+            pdfium_image_id = pdfium_session.image_id
+        elif pdfium_container_image:
+            with ContainerPdfiumSession(pdfium_container_image, source, work) as renderer:
+                pages = pdf_page_datasets(source, reader=renderer.read_info,
+                                          dataset_name=renderer.dataset_path)
+                if not 1 <= page <= len(pages):
+                    raise ValueError(f"GeoPDF page must be between 1 and {len(pages)}")
+                renderer.render_page(pages[page - 1], staged, dpi)
+                pdfium_image_id = renderer.image_id
+        else:
+            pages = pdf_page_datasets(source)
+            if not 1 <= page <= len(pages):
+                raise ValueError(f"GeoPDF page must be between 1 and {len(pages)}")
+            run([require_program("gdal_translate"), "-oo", f"DPI={dpi}", "-of", "GTiff",
+                 "-co", "TILED=YES", "-co", "COMPRESS=DEFLATE", pages[page - 1], str(staged)])
+
+        staged_hash = sha256(staged)
+        dimensions = read_info(staged).get("size")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix="geopdf-tiff-output-", suffix=".tmp",
+                                         dir=destination.parent, delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+            try:
+                with staged.open("rb") as rendered:
+                    shutil.copyfileobj(rendered, temporary)
+            except BaseException:
+                temporary.close()
+                temporary_path.unlink(missing_ok=True)
+                raise
+        try:
+            if overwrite:
+                temporary_path.replace(destination)
+            else:
+                # A hard link gives us an atomic no-clobber create on the same volume.
+                temporary_path.hardlink_to(destination)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+        return {
+            "source": str(source),
+            "source_sha256_before": pdf_hash,
+            "source_sha256_after": sha256(source),
+            "source_preserved": pdf_hash == sha256(source),
+            "saved_geotiff": str(destination),
+            "staged_geotiff_sha256": staged_hash,
+            "staged_geotiff_pixel_dimensions": dimensions,
+            "page": page,
+            "page_count": len(pages),
+            "dpi": dpi,
+            "renderer": ("Container PDFium" if pdfium_session is not None or pdfium_container_image
+                         else "Windows GDAL"),
+            "renderer_image": (pdfium_session.image if pdfium_session is not None
+                               else pdfium_container_image),
+            "renderer_image_id": (pdfium_session.image_id if pdfium_session is not None
+                                  else pdfium_image_id),
+        }
+    finally:
+        if work_context is not None:
+            work_context.cleanup()
+        elif pdfium_session is not None:
+            staged.unlink(missing_ok=True)
+
+
 def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int = 1,
                    overwrite: bool = False, keep_work: bool = False,
                    validation_gpx: Path | None = None, validation_grid: int = 3,
                    projected_grid_gpx: Path | None = None,
                    projected_grid_spacing: int = 50000,
                    save_geotiff: Path | None = None,
+                   ozi_output_directory: Path | None = None,
+                   mapc2mapc_executable: Path | None = None,
                    pdfium_container_image: str | None = None,
                    pdfium_session: ContainerPdfiumSession | None = None) -> dict:
     """Render one georeferenced PDF page to a temporary GeoTIFF, then create a QCT."""
@@ -973,6 +1218,8 @@ def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int
         raise ValueError("GeoPDF conversion expects a .pdf input")
     if dpi < 72 or dpi > 1200:
         raise ValueError("GeoPDF DPI must be between 72 and 1200")
+    if (ozi_output_directory is None) != (mapc2mapc_executable is None):
+        raise ValueError("OziExplorer output requires both an output folder and MAPC2MAPC executable")
     if projected_grid_gpx is not None and projected_grid_gpx.exists() and not overwrite:
         raise FileExistsError(f"Refusing to overwrite existing GPX: {projected_grid_gpx}")
     if save_geotiff is not None:
@@ -1047,6 +1294,13 @@ def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int
                         output.close()
                         save_geotiff.unlink(missing_ok=True)
                         raise
+        if ozi_output_directory is not None and mapc2mapc_executable is not None:
+            try:
+                report["ozi"] = convert_ozi_ozf2(
+                    staged, ozi_output_directory, mapc2mapc_executable,
+                    output_stem=source.stem, overwrite=overwrite)
+            except Exception as error:
+                report["ozi_error"] = str(error)
         report["source"] = str(source)
         report["source_sha256_before"] = pdf_hash
         report["source_sha256_after"] = sha256(source)
@@ -1090,11 +1344,15 @@ def convert_geopdf(source: Path, destination: Path, *, dpi: int = 300, page: int
 
 def convert_geotiff(source: Path, destination: Path, *, overwrite: bool = False,
                     keep_work: bool = False, validation_gpx: Path | None = None,
-                    validation_grid: int = 3, title: str | None = None) -> dict:
+                    validation_grid: int = 3, title: str | None = None,
+                    ozi_output_directory: Path | None = None,
+                    mapc2mapc_executable: Path | None = None) -> dict:
     source = source.resolve()
     destination = destination.resolve()
     if not source.is_file():
         raise FileNotFoundError(source)
+    if (ozi_output_directory is None) != (mapc2mapc_executable is None):
+        raise ValueError("OziExplorer output requires both an output folder and MAPC2MAPC executable")
     if destination.exists() and not overwrite:
         raise FileExistsError(f"Refusing to overwrite existing output: {destination}")
     if validation_gpx is not None:
@@ -1123,6 +1381,15 @@ def convert_geotiff(source: Path, destination: Path, *, overwrite: bool = False,
             validation_gpx.parent.mkdir(parents=True, exist_ok=True)
             write_validation_gpx(validation_gpx, calibration, indexed.width, indexed.height,
                                  validation_grid)
+        ozi_result = None
+        ozi_error = None
+        if ozi_output_directory is not None and mapc2mapc_executable is not None:
+            try:
+                ozi_result = convert_ozi_ozf2(
+                    source, ozi_output_directory, mapc2mapc_executable,
+                    output_stem=source.stem, overwrite=overwrite)
+            except Exception as error:
+                ozi_error = str(error)
         validation.update({
             "source": str(source),
             "source_sha256_before": source_hash,
@@ -1137,6 +1404,10 @@ def convert_geotiff(source: Path, destination: Path, *, overwrite: bool = False,
             "output": str(destination),
             "validation_gpx": str(validation_gpx) if validation_gpx else None,
         })
+        if ozi_result is not None:
+            validation["ozi"] = ozi_result
+        if ozi_error is not None:
+            validation["ozi_error"] = ozi_error
         if not validation["source_preserved"]:
             raise RuntimeError("source hash changed unexpectedly")
         log = destination.with_suffix(destination.suffix + ".validation.json")

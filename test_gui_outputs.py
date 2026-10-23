@@ -118,6 +118,38 @@ class GuiOutputTests(unittest.TestCase):
             self.assertIn("No projected-grid intersections", result["projected_grid_warning"])
             self.assertEqual(window.events.get_nowait(), ("finished", (1, 1, False)))
 
+    def test_ozi_ozf2_options_are_forwarded_and_outputs_are_preflight_protected(self):
+        with tempfile.TemporaryDirectory(dir=".") as folder:
+            root = Path(folder)
+            source = root / "map.tif"
+            source.write_bytes(b"source")
+            ozi = root / "ozi"
+            executable = root / "mapc2mapc64.exe"
+            executable.write_bytes(b"stub")
+            window = object.__new__(ConverterWindow)
+            window.events = queue.Queue()
+            window.stop_event = threading.Event()
+            settings = (root / "qct", False, 3, False, 50000, False, 150, 1, False,
+                        "Windows GDAL", "", True, ozi, executable)
+            (ozi).mkdir()
+            (ozi / "map.ozf2").write_bytes(b"existing")
+
+            with patch("geotiff_qct_gui.convert_geotiff") as convert:
+                window._convert_all([source], settings)
+                convert.assert_not_called()
+            self.assertEqual(window.events.get_nowait()[0], "preflight_failure")
+            self.assertEqual(window.events.get_nowait()[0], "finished")
+
+            (ozi / "map.ozf2").unlink()
+            with patch("geotiff_qct_gui.convert_geotiff", return_value={
+                    "source_preserved": True, "qct_palette_entries": 11,
+                    "ozi": {"map": str(ozi / "map.map"), "ozf2": str(ozi / "map.ozf2")},
+                    }) as convert:
+                window._convert_all([source], settings)
+            self.assertEqual(convert.call_args.kwargs["ozi_output_directory"], ozi)
+            self.assertEqual(convert.call_args.kwargs["mapc2mapc_executable"], executable)
+            self.assertEqual(window.events.get_nowait()[0], "success")
+
     def test_grid_only_generation_skips_existing_and_never_runs_qct_conversion(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -170,6 +202,67 @@ class GuiOutputTests(unittest.TestCase):
             result = window.events.get_nowait()
             self.assertEqual(result[0], "grid_success")
             self.assertIn("old GPX was removed", result[1][1]["warning"])
+
+    def test_tiff_backfill_skips_existing_tiff_and_never_touches_qct_or_gpx(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            pdf = root / "map.pdf"
+            pdf.write_bytes(b"source pdf")
+            output = root / "output"
+            output.mkdir()
+            tiff = output / "map.tif"
+            qct = output / "map.qct"
+            gpx = output / "map-checks.gpx"
+            tiff.write_bytes(b"keep tiff")
+            qct.write_bytes(b"keep qct")
+            gpx.write_bytes(b"keep gpx")
+            window = object.__new__(ConverterWindow)
+            window.events = queue.Queue()
+            window.stop_event = threading.Event()
+            settings = (output, 150, 1, False, "Windows GDAL", "")
+
+            with patch("geotiff_qct_gui.render_geopdf_to_geotiff") as render:
+                window._backfill_geotiffs_all([pdf], settings)
+
+            render.assert_not_called()
+            self.assertEqual(tiff.read_bytes(), b"keep tiff")
+            self.assertEqual(qct.read_bytes(), b"keep qct")
+            self.assertEqual(gpx.read_bytes(), b"keep gpx")
+            self.assertEqual(window.events.get_nowait()[0], "tiff_skipped")
+            self.assertEqual(window.events.get_nowait(), ("tiff_finished", (1, 1, False, 1)))
+
+    def test_tiff_backfill_overwrite_replaces_only_tiff(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            pdf = root / "map.pdf"
+            pdf.write_bytes(b"source pdf")
+            output = root / "output"
+            output.mkdir()
+            tiff = output / "map.tif"
+            qct = output / "map.qct"
+            gpx = output / "map-checks.gpx"
+            tiff.write_bytes(b"old tiff")
+            qct.write_bytes(b"keep qct")
+            gpx.write_bytes(b"keep gpx")
+            window = object.__new__(ConverterWindow)
+            window.events = queue.Queue()
+            window.stop_event = threading.Event()
+            settings = (output, 150, 1, True, "Windows GDAL", "")
+            report = {"saved_geotiff": str(tiff), "source_preserved": True}
+
+            def render(*args, **kwargs):
+                tiff.write_bytes(b"new tiff")
+                return report
+
+            with patch("geotiff_qct_gui.render_geopdf_to_geotiff", side_effect=render) as renderer:
+                window._backfill_geotiffs_all([pdf], settings)
+
+            renderer.assert_called_once()
+            self.assertEqual(tiff.read_bytes(), b"new tiff")
+            self.assertEqual(qct.read_bytes(), b"keep qct")
+            self.assertEqual(gpx.read_bytes(), b"keep gpx")
+            self.assertEqual(window.events.get_nowait()[0], "tiff_success")
+            self.assertEqual(window.events.get_nowait(), ("tiff_finished", (1, 1, False, 0)))
 
 
 if __name__ == "__main__":

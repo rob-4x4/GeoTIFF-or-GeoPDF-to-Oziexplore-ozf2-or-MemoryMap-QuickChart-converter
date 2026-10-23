@@ -20,6 +20,10 @@ or plug-in folders.
   `gdalinfo`.
 - For GeoPDF input, a GDAL PDF read backend such as Poppler or PDFium.
 - Python 3.10+ with Pillow.
+- Optional OziExplorer OZF2 output: a separately installed MAPC2MAPC program
+  with its documented `-az` batch export. QuickChart does not download,
+  install, or bundle MAPC2MAPC; select its executable in the GUI when enabling
+  the OZF2 option. The 64-bit executable is recommended for 64-bit Windows.
 - Optional for the GUI's container renderer: Docker Desktop or Podman Desktop
   with its engine running and the selected PDFium image already pulled locally.
 
@@ -124,6 +128,24 @@ GeoTIFF outputs are protected unless replacement is enabled. The option applies
 to PDF inputs only; existing GeoTIFF inputs are not duplicated. These TIFFs may
 be large and should be tested in the intended application before batch use.
 
+Select **Also create OziExplorer OZF2 + .map** to create a calibrated Ozi map
+pair in its separately selected folder. This uses an existing MAPC2MAPC
+installation in its documented command-line batch mode (`-az`); QuickChart
+does not install or bundle MAPC2MAPC. The app writes a temporary Ozi MAP 2.1
+calibration linked to the georeferenced raster, asks MAPC2MAPC to create the
+OZF2 pair, then publishes the completed `.ozf2` and matching `.map` together.
+MAPC2MAPC must be installed separately and its executable selected in the
+**MAPC2MAPC executable** field; conversion is unavailable if that file is not
+selected or cannot be run.
+For GeoPDF inputs the selected page is rendered with the chosen renderer and DPI
+first. Existing OZF2/MAP outputs are protected unless replacement is enabled.
+OZF2 is supported by OziExplorer for Windows and Android; Img2Ozf is not needed
+for this option. Check one output pair in both intended OziExplorer versions,
+including alignment against known grid crossings, before using it for a batch.
+MAPC2MAPC's documented `-az` output is described as an Androzic/Ozi-compatible
+OZF2 set, while the current official Ozi Img2Ozf utility creates OZF4 rather
+than OZF2.
+
 At startup the **GDAL readiness** panel checks that `gdalinfo`,
 `gdal_translate`, and `gdaltransform` can run, that the GeoTIFF driver is
 available, and whether the GeoPDF driver is present for GeoPDF conversion.
@@ -183,6 +205,17 @@ GeoPDFs or GeoTIFFs (a QCT by itself does not retain the source projected CRS
 needed for this check); GeoPDFs are temporarily rendered with the selected
 renderer, page, and DPI. Existing GPX files are skipped unless replacement is
 enabled, so the action can safely fill in missing checkpoints in a prior batch.
+
+Use **GeoTIFF backfill only** when QCTs already exist but some rendered GeoTIFFs
+are missing. Select the original GeoPDFs and choose the same output folder;
+the app renders the selected page at the chosen DPI and writes only the `.tif`
+files. Existing TIFFs are skipped by default, so this is suitable for filling
+gaps in a large batch. If **Allow replacement of existing output files** is
+enabled, the app asks for confirmation and replaces only the selected TIFFs.
+This action never creates or changes QCTs, validation JSON, or GPX files. The
+normal **Convert selected maps** action remains available when you want to
+write QCTs and choose either or both GPX checkpoint types; its overwrite
+setting applies to those selected outputs (and any optional GeoTIFF outputs).
 
 The GUI is a thin interface over `geotiff_to_qct.py`; it does not contain a
 separate writer or change GDAL configuration. The same GDAL and Pillow

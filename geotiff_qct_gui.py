@@ -25,6 +25,7 @@ from tkinter.scrolledtext import ScrolledText
 from geotiff_to_qct import (convert_geopdf, convert_geotiff,
                             DEFAULT_PDFIUM_CONTAINER_IMAGE, ContainerPdfiumSession,
                             container_runtime_status, probe_pdfium_container,
+                            render_geopdf_to_geotiff,
                             write_projected_grid_validation,
                             write_projected_grid_validation_from_geopdf)
 
@@ -102,6 +103,9 @@ class ConverterWindow:
         self.pdf_dpi = IntVar(value=300)
         self.pdf_page = IntVar(value=1)
         self.save_geotiff = BooleanVar(value=False)
+        self.save_ozi_ozf2 = BooleanVar(value=False)
+        self.ozi_output_directory = StringVar()
+        self.mapc2mapc_executable = StringVar()
         self.allow_overwrite = BooleanVar(value=False)
         self._build()
         self._refresh_gdal()
@@ -176,6 +180,22 @@ class ConverterWindow:
                         variable=self.allow_overwrite).grid(row=1, column=0, columnspan=2, sticky="w", pady=(7, 0))
         ttk.Checkbutton(destination, text="Also save GeoPDF pages as GeoTIFF (.tif)",
                         variable=self.save_geotiff).grid(row=2, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        self.ozi_output_check = ttk.Checkbutton(
+            destination, text="Also create OziExplorer OZF2 + .map (requires MAPC2MAPC)",
+            variable=self.save_ozi_ozf2)
+        self.ozi_output_check.grid(row=3, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ttk.Label(destination, text="OziExplorer output folder:").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        self.ozi_output_entry = ttk.Entry(destination, textvariable=self.ozi_output_directory)
+        self.ozi_output_entry.grid(row=5, column=0, sticky="ew", pady=(3, 0))
+        self.ozi_output_button = ttk.Button(destination, text="Choose Ozi folder…",
+                                            command=self._choose_ozi_output)
+        self.ozi_output_button.grid(row=5, column=1, padx=(7, 0), pady=(3, 0))
+        ttk.Label(destination, text="MAPC2MAPC executable:").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        self.mapc2mapc_entry = ttk.Entry(destination, textvariable=self.mapc2mapc_executable)
+        self.mapc2mapc_entry.grid(row=7, column=0, sticky="ew", pady=(3, 0))
+        self.mapc2mapc_button = ttk.Button(destination, text="Choose MAPC2MAPC…",
+                                           command=self._choose_mapc2mapc)
+        self.mapc2mapc_button.grid(row=7, column=1, padx=(7, 0), pady=(3, 0))
 
         validation = ttk.LabelFrame(outer, text="Validation outputs", padding=8)
         validation.grid(row=4, column=0, sticky="ew", pady=(0, 10))
@@ -206,12 +226,15 @@ class ConverterWindow:
         self.grid_only_button = ttk.Button(action, text="Create grid GPX only",
                                            command=self._start_grid_generation)
         self.grid_only_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.tiff_only_button = ttk.Button(action, text="GeoTIFF backfill only",
+                                           command=self._start_tiff_backfill)
+        self.tiff_only_button.grid(row=0, column=2, sticky="w", padx=(8, 0))
         self.stop_button = ttk.Button(action, text="Stop after current map", command=self._request_stop,
                                       state="disabled")
-        self.stop_button.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        self.stop_button.grid(row=0, column=3, sticky="w", padx=(8, 0))
         self.progress = ttk.Progressbar(action, mode="determinate")
-        self.progress.grid(row=0, column=3, sticky="ew", padx=(12, 0))
-        action.columnconfigure(3, weight=1)
+        self.progress.grid(row=0, column=4, sticky="ew", padx=(12, 0))
+        action.columnconfigure(4, weight=1)
 
         ttk.Label(outer, text="Results", font=("Segoe UI", 11, "bold")).grid(row=6, column=0, sticky="w", pady=(12, 0))
         self.results = ScrolledText(outer, height=11, wrap="word", state="disabled")
@@ -246,6 +269,18 @@ class ConverterWindow:
         selected = filedialog.askdirectory(title="Choose a new or existing output folder")
         if selected:
             self.output_directory.set(selected)
+
+    def _choose_ozi_output(self) -> None:
+        selected = filedialog.askdirectory(title="Choose a folder for OZF2 and MAP outputs")
+        if selected:
+            self.ozi_output_directory.set(selected)
+
+    def _choose_mapc2mapc(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select the MAPC2MAPC 64-bit executable",
+            filetypes=[("Windows programs", "*.exe"), ("All files", "*.*")])
+        if selected:
+            self.mapc2mapc_executable.set(selected)
 
     def _choose_gdal_folder(self) -> None:
         selected = filedialog.askdirectory(title="Choose the folder containing GDAL programs")
@@ -296,6 +331,15 @@ class ConverterWindow:
         if not self.output_directory.get().strip():
             messagebox.showerror(APPLICATION_TITLE, "Choose an output folder.")
             return
+        if self.save_ozi_ozf2.get():
+            if not self.ozi_output_directory.get().strip():
+                messagebox.showerror(APPLICATION_TITLE, "Choose an OziExplorer output folder.")
+                return
+            executable = Path(self.mapc2mapc_executable.get().strip()).expanduser()
+            if not executable.is_file():
+                messagebox.showerror(APPLICATION_TITLE,
+                                     "Select the MAPC2MAPC executable. QuickChart does not install or bundle it.")
+                return
         if not self.image_frame_gpx.get() and not self.projected_grid_gpx.get():
             if not messagebox.askyesno(APPLICATION_TITLE,
                                        "No validation GPX files are selected. Continue anyway?"):
@@ -331,7 +375,12 @@ class ConverterWindow:
         self._log(f"Starting {len(self.files)} map conversion(s) into: {output}")
         settings = (output, self.image_frame_gpx.get(), image_grid, self.projected_grid_gpx.get(),
                     projected_spacing, self.allow_overwrite.get(), pdf_dpi, pdf_page,
-                    self.save_geotiff.get(), renderer, pdfium_image)
+                    self.save_geotiff.get(), renderer, pdfium_image,
+                    self.save_ozi_ozf2.get(),
+                    Path(self.ozi_output_directory.get()).expanduser().resolve()
+                    if self.save_ozi_ozf2.get() else None,
+                    Path(self.mapc2mapc_executable.get()).expanduser().resolve()
+                    if self.save_ozi_ozf2.get() else None)
         threading.Thread(target=self._convert_all, args=(list(self.files), settings), daemon=True).start()
 
     def _start_grid_generation(self) -> None:
@@ -405,6 +454,135 @@ class ConverterWindow:
         settings = (output, spacing, pdf_dpi, pdf_page, self.allow_overwrite.get(), renderer, pdfium_image)
         threading.Thread(target=self._create_projected_grid_all,
                          args=(list(self.files), settings), daemon=True).start()
+
+    def _start_tiff_backfill(self) -> None:
+        """Render selected GeoPDFs as TIFFs only, without touching QCT or GPX files."""
+        self._refresh_gdal()
+        if not self.gdal_ready:
+            messagebox.showerror(APPLICATION_TITLE,
+                                 "GDAL is not ready. Select the folder containing gdalinfo, "
+                                 "gdal_translate, and gdaltransform, then click Refresh.")
+            return
+        sources = [source for source in self.files if source.suffix.lower() == ".pdf"]
+        if not sources:
+            messagebox.showerror(APPLICATION_TITLE,
+                                 "Select the original GeoPDF files for GeoTIFF backfill.")
+            return
+        if len(sources) != len(self.files):
+            messagebox.showerror(APPLICATION_TITLE,
+                                 "GeoTIFF backfill accepts GeoPDF files only. Remove any GeoTIFF inputs.")
+            return
+        renderer = self.pdf_renderer.get()
+        pdfium_image = self.pdfium_image.get().strip()
+        if renderer == "Windows GDAL" and not self.gdal_status.geopdf:
+            messagebox.showerror(APPLICATION_TITLE,
+                                 "GeoPDF input was selected, but the installed GDAL PDF driver is unavailable.")
+            return
+        if renderer == "Container PDFium":
+            status = probe_pdfium_container(pdfium_image)
+            self.pdfium_status_text.set(status.message)
+            if not status.ready:
+                messagebox.showerror(APPLICATION_TITLE, status.message)
+                return
+        if not self.output_directory.get().strip():
+            messagebox.showerror(APPLICATION_TITLE, "Choose the folder for the GeoTIFF files.")
+            return
+        try:
+            dpi = int(self.pdf_dpi.get())
+            page = int(self.pdf_page.get())
+            if not 72 <= dpi <= 1200:
+                raise ValueError("GeoPDF rendering DPI must be between 72 and 1200.")
+            if page < 1:
+                raise ValueError("GeoPDF page must be 1 or greater.")
+        except (TypeError, ValueError) as error:
+            messagebox.showerror(APPLICATION_TITLE, str(error))
+            return
+        duplicate_stems = {source.stem for source in sources
+                           if sum(candidate.stem == source.stem for candidate in sources) > 1}
+        if duplicate_stems:
+            messagebox.showerror(APPLICATION_TITLE,
+                                 "Selected PDFs have duplicate names: " + ", ".join(sorted(duplicate_stems)) +
+                                 ". Use separate output folders.")
+            return
+        output = Path(self.output_directory.get()).expanduser().resolve()
+        existing = [output / f"{source.stem}.tif" for source in sources
+                    if (output / f"{source.stem}.tif").exists()]
+        overwrite = self.allow_overwrite.get()
+        if overwrite and existing and not messagebox.askyesno(
+                APPLICATION_TITLE,
+                f"Replace {len(existing)} existing GeoTIFF file(s)?\n\n"
+                "This backfill action changes only the selected .tif files. QCTs and GPX files are untouched."):
+            return
+        self.stop_event.clear()
+        self._set_busy(True)
+        self.progress.configure(maximum=len(sources), value=0)
+        disposition = "replacing selected TIFFs when present" if overwrite else "filling missing TIFFs only"
+        self._log(f"Starting GeoTIFF-only backfill for {len(sources)} GeoPDF(s) into: {output}; {disposition}.")
+        settings = (output, dpi, page, overwrite, renderer, pdfium_image)
+        threading.Thread(target=self._backfill_geotiffs_all,
+                         args=(sources, settings), daemon=True).start()
+
+    def _backfill_geotiffs_all(self, sources: list[Path],
+                               settings: tuple[Path, int, int, bool, str, str]) -> None:
+        output, dpi, page, overwrite, renderer, pdfium_image = settings
+        planned = [output / f"{source.stem}.tif" for source in sources]
+        source_paths = {source.resolve() for source in sources}
+        conflicts = [path for path in planned if path.resolve() in source_paths]
+        if conflicts:
+            self.events.put(("preflight_failure", conflicts))
+            self.events.put(("tiff_finished", (0, len(sources), False, 0)))
+            return
+        output.mkdir(parents=True, exist_ok=True)
+        pdfium_session = None
+        pdfium_work_context = None
+        if renderer == "Container PDFium":
+            try:
+                pdfium_work_context = tempfile.TemporaryDirectory(prefix="quickchart-tiff-pdfium-batch-")
+                pdfium_session = ContainerPdfiumSession(
+                    pdfium_image, sources, Path(pdfium_work_context.name))
+                pdfium_session.__enter__()
+            except Exception as error:
+                if pdfium_session is not None and pdfium_session.started:
+                    try:
+                        pdfium_session.__exit__(type(error), error, error.__traceback__)
+                    except Exception:
+                        pass
+                if pdfium_work_context is not None:
+                    pdfium_work_context.cleanup()
+                self.events.put(("batch_failure", f"Could not start the shared PDFium container: {error}"))
+                self.events.put(("tiff_finished", (0, len(sources), False, 0)))
+                return
+
+        processed = 0
+        skipped = 0
+        for index, source in enumerate(sources, start=1):
+            if self.stop_event.is_set():
+                break
+            target = output / f"{source.stem}.tif"
+            if target.exists() and not overwrite:
+                skipped += 1
+                processed += 1
+                self.events.put(("tiff_skipped", (index, target)))
+                continue
+            try:
+                report = render_geopdf_to_geotiff(
+                    source, target, dpi=dpi, page=page, overwrite=overwrite,
+                    pdfium_container_image=(pdfium_image if renderer == "Container PDFium"
+                                            and pdfium_session is None else None),
+                    pdfium_session=pdfium_session)
+                self.events.put(("tiff_success", (index, report)))
+            except Exception as error:
+                self.events.put(("failure", (index, source, str(error), traceback.format_exc())))
+            processed += 1
+
+        if pdfium_session is not None:
+            try:
+                pdfium_session.__exit__(None, None, None)
+            except Exception as error:
+                self.events.put(("batch_failure", f"Could not clean up the shared PDFium container: {error}"))
+        if pdfium_work_context is not None:
+            pdfium_work_context.cleanup()
+        self.events.put(("tiff_finished", (processed, len(sources), self.stop_event.is_set(), skipped)))
 
     def _create_projected_grid_all(self, sources: list[Path],
                                    settings: tuple[Path, int, int, int, bool, str, str]) -> None:
@@ -488,16 +666,21 @@ class ConverterWindow:
             pdfium_work_context.cleanup()
         self.events.put(("grid_finished", (processed, len(sources), self.stop_event.is_set(), skipped)))
 
-    def _convert_all(self, sources: list[Path],
-                     settings: tuple[Path, bool, int, bool, int, bool, int, int, bool, str, str]) -> None:
+    def _convert_all(self, sources: list[Path], settings: tuple) -> None:
         (output, use_frame_gpx, frame_grid, use_projected_gpx, spacing, overwrite,
-         pdf_dpi, pdf_page, save_tiff, renderer, pdfium_image) = settings
+         pdf_dpi, pdf_page, save_tiff, renderer, pdfium_image, *ozi_settings) = settings
+        save_ozi = ozi_settings[0] if len(ozi_settings) > 0 else False
+        ozi_output = ozi_settings[1] if len(ozi_settings) > 1 else None
+        mapc2mapc = ozi_settings[2] if len(ozi_settings) > 2 else None
         planned = []
         for source in sources:
             destination = output / f"{source.stem}.qct"
             planned.append(destination)
             if save_tiff and source.suffix.lower() == ".pdf":
                 planned.append(output / f"{source.stem}.tif")
+            if save_ozi and ozi_output is not None:
+                planned.extend((ozi_output / f"{source.stem}.map",
+                                ozi_output / f"{source.stem}.ozf2"))
             if use_frame_gpx:
                 planned.append(output / f"{source.stem}-checks.gpx")
             if use_projected_gpx:
@@ -548,13 +731,17 @@ class ConverterWindow:
                                             validation_grid=frame_grid, projected_grid_gpx=projected_gpx,
                                             projected_grid_spacing=spacing,
                                             save_geotiff=output / f"{source.stem}.tif" if save_tiff else None,
+                                            ozi_output_directory=ozi_output if save_ozi else None,
+                                            mapc2mapc_executable=mapc2mapc if save_ozi else None,
                                             pdfium_container_image=(pdfium_image if renderer == "Container PDFium"
                                                                     and pdfium_session is None else None),
                                             pdfium_session=pdfium_session)
                     projected_count = report.get("projected_grid_checkpoints")
                 else:
                     report = convert_geotiff(source, destination, overwrite=overwrite,
-                                             validation_gpx=frame_gpx, validation_grid=frame_grid)
+                                             validation_gpx=frame_gpx, validation_grid=frame_grid,
+                                             ozi_output_directory=ozi_output if save_ozi else None,
+                                             mapc2mapc_executable=mapc2mapc if save_ozi else None)
                     projected_count = None
                     if projected_gpx is not None:
                         projected_count = write_projected_grid_validation(source, projected_gpx, spacing)
@@ -576,6 +763,8 @@ class ConverterWindow:
                           "source_preserved": report["source_preserved"],
                           "qct_palette_entries": report["qct_palette_entries"],
                           "saved_geotiff": report.get("geopdf", {}).get("saved_geotiff"),
+                          "ozi": report.get("ozi"),
+                          "ozi_error": report.get("ozi_error"),
                           "geopdf": report.get("geopdf")}
                 self.events.put(("success", (index, result)))
             except Exception as error:  # Surface one map failure without abandoning a batch.
@@ -599,6 +788,8 @@ class ConverterWindow:
                     self.progress.configure(value=index)
                     if result.get("projected_grid_warning"):
                         self._log("WARNING: " + result["projected_grid_warning"])
+                    if result.get("ozi_error"):
+                        self._log("WARNING: OziExplorer OZF2 output was not created: " + result["ozi_error"])
                     self._log("SUCCESS\n" + json.dumps(result, indent=2))
                 elif kind == "grid_success":
                     index, result = payload  # type: ignore[misc]
@@ -610,6 +801,14 @@ class ConverterWindow:
                     index, path = payload  # type: ignore[misc]
                     self.progress.configure(value=index)
                     self._log(f"SKIPPED (existing GPX protected): {path}")
+                elif kind == "tiff_success":
+                    index, result = payload  # type: ignore[misc]
+                    self.progress.configure(value=index)
+                    self._log("GEOTIFF BACKFILL SUCCESS\n" + json.dumps(result, indent=2))
+                elif kind == "tiff_skipped":
+                    index, path = payload  # type: ignore[misc]
+                    self.progress.configure(value=index)
+                    self._log(f"SKIPPED (existing GeoTIFF protected): {path}")
                 elif kind == "failure":
                     index, source, message, details = payload  # type: ignore[misc]
                     self.progress.configure(value=index)
@@ -637,6 +836,15 @@ class ConverterWindow:
                     else:
                         self._log(f"Finished projected-grid GPX generation for {processed} of {total} map(s). "
                                   f"Skipped {skipped} existing GPX file(s).")
+                elif kind == "tiff_finished":
+                    self._set_busy(False)
+                    processed, total, stopped, skipped = payload  # type: ignore[misc]
+                    if stopped:
+                        self._log(f"Stopped after the current map. Processed {processed} of {total}; "
+                                  "remaining maps were not started.")
+                    else:
+                        self._log(f"Finished GeoTIFF-only backfill for {processed} of {total} GeoPDF(s). "
+                                  f"Skipped {skipped} existing TIFF file(s). QCT and GPX outputs were not changed.")
         except queue.Empty:
             pass
         self.root.after(100, self._poll_events)
@@ -644,8 +852,10 @@ class ConverterWindow:
     def _set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
         for widget in (self.add_button, self.remove_button, self.clear_button, self.convert_button,
-                       self.grid_only_button,
-                       self.pdfium_image_entry, self.pdfium_check_button):
+                       self.grid_only_button, self.tiff_only_button,
+                       self.pdfium_image_entry, self.pdfium_check_button, self.ozi_output_check,
+                       self.ozi_output_entry, self.ozi_output_button,
+                       self.mapc2mapc_entry, self.mapc2mapc_button):
             widget.configure(state=state)
         self.stop_button.configure(state="normal" if busy and not self.stop_event.is_set() else "disabled")
         self.pdf_renderer_choice.configure(state="disabled" if busy else "readonly")
